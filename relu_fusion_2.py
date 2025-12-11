@@ -404,8 +404,11 @@ end = time.time()
 avg_time_ms = (end - start) / iters * 1000
 print("Average fwd time (ms):", avg_time_ms)
 
-fwd_traffic_elements = batch * dim + dim * hdim + 2 * batch * hdim
-fwd_traffic_gb = fwd_traffic_elements * 2 / 1e9
+fwd_traffic_input_elements = batch * dim + dim * hdim
+fwd_traffic_output_elements = 2 * batch * hdim
+fwd_traffic_input_gb = 2 * fwd_traffic_input_elements / 1e9
+fwd_traffic_output_gb = 2 * fwd_traffic_output_elements / 1e9
+fwd_traffic_gb = fwd_traffic_input_gb + fwd_traffic_output_gb 
 fwd_bw_gb_s = fwd_traffic_gb / (avg_time_ms / 1000)
 fwd_bw_util = int(fwd_bw_gb_s / bw_4090_gb_s * 100)
 fwd_bw_util_h100 = int(fwd_bw_gb_s / bw_h100_gb_s * 100)
@@ -414,12 +417,15 @@ fwd_tflops = ((2 * batch * dim * hdim) / 1e12) / (avg_time_ms / 1000)
 fwd_tflops_util = int(fwd_tflops / tflops_4090 * 100)
 fwd_tflops_util_h100 = int(fwd_tflops / tflops_h100 * 100)
 
+print("Forward input traffic (GB):", fwd_traffic_input_gb)
+print("Forward output traffic (GB):", fwd_traffic_output_gb)
 print("Forward BW (GB / s):", fwd_bw_gb_s)
 print("Forward BW util RTX 4090 (%):", fwd_bw_util)
 print("Forward BW util H100 (%):", fwd_bw_util_h100)
 print("Forward TFLOPS:", fwd_tflops)
 print("Forward TFLOPS util RTX 4090 (%):", fwd_tflops_util)
 print("Forward TFLOPS util H100 (%):", fwd_tflops_util_h100)
+print()
 
 # Benchmark bwd
 torch.cuda.synchronize()
@@ -433,8 +439,11 @@ end = time.time()
 avg_time_ms_bwd = (end - start) / iters * 1000
 print("Average bwd time (ms):", avg_time_ms_bwd)
 
-bwd_traffic_elements = batch * dim + dim * hdim + 2 * batch * hdim
-bwd_traffic_gb = bwd_traffic_elements * 2 / 1e9
+bwd_traffic_input_elements = batch * dim + dim * hdim + batch * hdim
+bwd_traffic_output_elements = batch * hdim
+bwd_traffic_input_gb = bwd_traffic_input_elements * 2 / 1e9
+bwd_traffic_output_gb = bwd_traffic_output_elements * 2 / 1e9
+bwd_traffic_gb = bwd_traffic_input_gb + bwd_traffic_output_gb
 bwd_bw_gb_s = bwd_traffic_gb / (avg_time_ms_bwd / 1000)
 bwd_bw_util = int(bwd_bw_gb_s / bw_4090_gb_s * 100)
 bwd_bw_util_h100 = int(bwd_bw_gb_s / bw_h100_gb_s * 100)
@@ -443,6 +452,8 @@ bwd_tflops = ((2 * batch * dim * hdim) / 1e12) / (avg_time_ms_bwd / 1000)
 bwd_tflops_util = int(bwd_tflops / tflops_4090 * 100)
 bwd_tflops_util_h100 = int(bwd_tflops / tflops_h100 * 100)
 
+print("Backward input traffic (GB):", bwd_traffic_input_gb)
+print("Backward output traffic (GB):", bwd_traffic_output_gb)
 print("Backward BW (GB / s):", bwd_bw_gb_s)
 print("Backward BW util RTX 4090 (%):", bwd_bw_util)
 print("Backward BW util H100 (%):", bwd_bw_util_h100)
