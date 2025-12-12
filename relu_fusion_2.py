@@ -25,7 +25,7 @@ def reference(x, W1, W2):
 
 def get_cuda_autotune_config():
     return [
-        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8}, num_stages=3,
+        triton.Config({'BLOCK_SIZE_M': 256, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8}, num_stages=4,
                       num_warps=8),
         triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4,
                       num_warps=4),
@@ -63,12 +63,6 @@ def get_cuda_autotune_config():
 
 def get_autotune_config():
     return get_cuda_autotune_config()
-
-# We can fuse `leaky_relu` by providing it as an `ACTIVATION` meta-parameter in `matmul_kernel`.
-@triton.jit
-def relu_squared(x):
-    relu = tl.where(x >= 0, x, 0)
-    return relu * relu
 
 # `triton.jit`'ed functions can be auto-tuned by using the `triton.autotune` decorator, which consumes:
 #   - A list of `triton.Config` objects that define different configurations of
@@ -156,7 +150,8 @@ def matmul_kernel(
         b_ptrs += BLOCK_SIZE_K * stride_bk
 
     c_pre = accumulator.to(a_ptr.type.element_ty)
-    c_post = relu_squared(c_pre)
+    c_post = tl.maximum(c_pre, 0)
+    c_post = c_post * c_post
 
     # -----------------------------------------------------------
     # Write back the block of the output matrix C with masks.
