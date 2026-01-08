@@ -131,7 +131,7 @@ def matmul_tma_persistent_get_configs(pre_hook=None):
     key=["M", "N", "K", "WARP_SPECIALIZE"],
 )
 @triton.jit(launch_metadata=_matmul_launch_metadata)
-def matmul_kernel_tma_persistent(a_desc, b_desc, c_desc,  #
+def matmul_kernel_tma_persistent(a_desc, b_desc, c_desc, c_post,  #
                                  M, N, K,  #
                                  BLOCK_SIZE_M: tl.constexpr,  #
                                  BLOCK_SIZE_N: tl.constexpr,  #
@@ -199,6 +199,7 @@ def matmul_tma_persistent(a, b, warp_specialize: bool):
     dtype = a.dtype
 
     c = torch.empty((M, N), device=a.device, dtype=dtype)
+    c_post = torch.empty((M, N), device=a.device, dtype=dtype)
 
     NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
 
@@ -207,6 +208,7 @@ def matmul_tma_persistent(a, b, warp_specialize: bool):
     a_desc = TensorDescriptor.from_tensor(a, dummy_block)
     b_desc = TensorDescriptor.from_tensor(b, dummy_block)
     c_desc = TensorDescriptor.from_tensor(c, dummy_block)
+    c_post_desc = TensorDescriptor.from_tensor(c_post, dummy_block)
 
     def grid(META):
         nonlocal a_desc, b_desc, c_desc
@@ -218,13 +220,13 @@ def matmul_tma_persistent(a, b, warp_specialize: bool):
         ), )
 
     matmul_kernel_tma_persistent[grid](
-        a_desc, b_desc, c_desc,  #
+        a_desc, b_desc, c_desc, c_post,#
         M, N, K,  #
         FP8_OUTPUT=dtype == torch.float8_e4m3fn,  #
         NUM_SMS=NUM_SMS,  #
         WARP_SPECIALIZE=warp_specialize,  #
     )
-    return c
+    return c, c_post
 
 # `triton.jit`'ed functions can be auto-tuned by using the `triton.autotune` decorator, which consumes:
 #   - A list of `triton.Config` objects that define different configurations of
@@ -556,12 +558,13 @@ tflops_h100 = 989
 
 W1_T_contig = W1.T.contiguous()
 for i in range(5):
-    pre = matmul_tma_persistent(x, W1_T_contig, False)
+    pre, post = matmul_tma_persistent(x, W1_T_contig, False)
+
 torch.cuda.synchronize()
 start = time.time()
 for i in range(iters):
     #pre, post = forward_kernel(x, W1)
-   pre = matmul_tma_persistent(x, W1_T_contig, False)
+   pre, post = matmul_tma_persistent(x, W1_T_contig, False)
 torch.cuda.synchronize()
 end = time.time()
 
