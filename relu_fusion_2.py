@@ -35,12 +35,12 @@ def _compute_pid(tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M, NUM_SMS):
 dtype = torch.bfloat16
 
 x = torch.randn((batch, dim), dtype=dtype, device="cuda")
-W1 = torch.randn((dim, hdim), dtype=dtype, device="cuda")
+W1 = torch.randn((hdim, dim), dtype=dtype, device="cuda")
 W2 = torch.randn((dim, hdim), dtype=dtype, device="cuda")
 
 def reference(x, W1, W2):
   range_push("Unfused forward")
-  x1 = x @ W1
+  x1 = x @ W1.T
   x2 = F.relu(x1).square()
   x3 = x2 @ W2.T
   range_pop()
@@ -107,8 +107,10 @@ def matmul_tma_set_block_size_hook(nargs):
     nargs["b_desc"].block_shape = [BLOCK_N, BLOCK_K]
     if EPILOGUE_SUBTILE:
         nargs["c_desc"].block_shape = [BLOCK_M, BLOCK_N // 2]
+        nargs["c_post_desc"].block_shape = [BLOCK_M, BLOCK_N // 2]
     else:
         nargs["c_desc"].block_shape = [BLOCK_M, BLOCK_N]
+        nargs["c_post_desc"].block_shape = [BLOCK_M, BLOCK_N]
 
 def matmul_tma_persistent_get_configs(pre_hook=None):
     return [
@@ -131,7 +133,7 @@ def matmul_tma_persistent_get_configs(pre_hook=None):
     key=["M", "N", "K", "WARP_SPECIALIZE"],
 )
 @triton.jit(launch_metadata=_matmul_launch_metadata)
-def matmul_kernel_tma_persistent(a_desc, b_desc, c_desc, c_post,  #
+def matmul_kernel_tma_persistent(a_desc, b_desc, c_desc, c_post_desc,  #
                                  M, N, K,  #
                                  BLOCK_SIZE_M: tl.constexpr,  #
                                  BLOCK_SIZE_N: tl.constexpr,  #
@@ -181,12 +183,21 @@ def matmul_kernel_tma_persistent(a_desc, b_desc, c_desc, c_post,  #
             acc = tl.permute(acc, (0, 2, 1))
             acc0, acc1 = tl.split(acc)
             c0 = acc0.to(dtype)
+            c0_post = tl.maximum(c0, 0)
+            c0_post = c0_post * c0_post
             c_desc.store([offs_am_c, offs_bn_c], c0)
+            c_post_desc.store([offs_am_c, offs_bn_c], c0_post)
             c1 = acc1.to(dtype)
+            c1_post = tl.maximum(c1, 0)
+            c1_post = c1_post * c1_post
             c_desc.store([offs_am_c, offs_bn_c + BLOCK_SIZE_N // 2], c1)
+            c_post_desc.store([offs_am_c, offs_bn_c + BLOCK_SIZE_N // 2], c1_post)
         else:
             accumulator = accumulator.to(dtype)
             c_desc.store([offs_am_c, offs_bn_c], accumulator)
+            post = tl.maximum(accumulator, 0)
+            post = post * post 
+            c_post_desc.store([offs_am_c, offs_bn_c], post)
 
 
 def matmul_tma_persistent(a, b, warp_specialize: bool):
@@ -211,7 +222,7 @@ def matmul_tma_persistent(a, b, warp_specialize: bool):
     c_post_desc = TensorDescriptor.from_tensor(c_post, dummy_block)
 
     def grid(META):
-        nonlocal a_desc, b_desc, c_desc
+        nonlocal a_desc, b_desc, c_desc, c_post_desc
         BLOCK_M = META["BLOCK_SIZE_M"]
         BLOCK_N = META["BLOCK_SIZE_N"]
         return (min(
@@ -220,7 +231,7 @@ def matmul_tma_persistent(a, b, warp_specialize: bool):
         ), )
 
     matmul_kernel_tma_persistent[grid](
-        a_desc, b_desc, c_desc, c_post,#
+        a_desc, b_desc, c_desc, c_post_desc,#
         M, N, K,  #
         FP8_OUTPUT=dtype == torch.float8_e4m3fn,  #
         NUM_SMS=NUM_SMS,  #
@@ -324,7 +335,7 @@ def matmul_kernel(
     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     c_ptrs = c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
     c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
-    #tl.store(c_ptrs, c_post, mask=c_mask)
+    tl.store(c_ptrs, c_post, mask=c_mask)
 
     c_pre_ptrs = c_pre_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
     tl.store(c_pre_ptrs, c_pre, mask=c_mask)
@@ -468,16 +479,12 @@ def bwd_kernel(a, b, pre):
     return c
 
 
-def custom_kernels(x, W1, W2):
-  pre, x1 = forward_kernel(x, W1)
-  x3 = x1 @ W2.T
-  return pre, x3
-
 class FusedLinearReLUSquareFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, W1, W2):
         range_push("fused fwd")
-        pre, post = forward_kernel(x, W1)
+        pre, post = forward_kernel(x, W1.T)
+        #pre, post = matmul_tma_persistent(x, W1, False)
         x3 = post @ W2.T
         ctx.save_for_backward(x, W1, W2, pre, post)
         range_pop()
@@ -504,13 +511,13 @@ class FusedLinearReLUSquareFunction(torch.autograd.Function):
 
         # dpre is [batch x hdim]
         # x is [batch x dim]
-        # dW1 is [dim x hdim]
-        dW1 = x.T @ dpre
+        # dW1 is [hdim x dim]
+        dW1 = dpre.T @ x
 
         # dpre is [batch x hdim]
-        # W1 is [dim x hdim]
+        # W1 is [hdim x dim]
         # dx is [batch x dim]
-        dx = dpre @ W1.T
+        dx = dpre @ W1
 
         range_pop()
         
@@ -536,11 +543,11 @@ range_pop()
 
 out_kernel.backward(grad_out)
 
-#torch.testing.assert_close(out_ref, out_kernel)
+torch.testing.assert_close(out_ref, out_kernel)
 
-#torch.testing.assert_close(W2_ref.grad, W2_kernel.grad)
-#torch.testing.assert_close(W1_ref.grad, W1_kernel.grad)
-#torch.testing.assert_close(x_ref.grad, x_kernel.grad)
+torch.testing.assert_close(W2_ref.grad, W2_kernel.grad)
+torch.testing.assert_close(W1_ref.grad, W1_kernel.grad)
+torch.testing.assert_close(x_ref.grad, x_kernel.grad)
 
 print("PASS")
 
@@ -556,15 +563,13 @@ tflops_h100 = 989
   
 
 
-W1_T_contig = W1.T.contiguous()
 for i in range(5):
-    pre, post = matmul_tma_persistent(x, W1_T_contig, False)
+    pre, post = matmul_tma_persistent(x, W1, False)
 
 torch.cuda.synchronize()
 start = time.time()
 for i in range(iters):
-    #pre, post = forward_kernel(x, W1)
-   pre, post = matmul_tma_persistent(x, W1_T_contig, False)
+   pre, post = matmul_tma_persistent(x, W1, False)
 torch.cuda.synchronize()
 end = time.time()
 
@@ -575,7 +580,7 @@ print("Average fwd time (ms):", avg_time_ms)
 torch.cuda.synchronize()
 start = time.time()
 for i in range(iters):
-   pre = x @ W1
+   pre = x @ W1.T
 torch.cuda.synchronize()
 end = time.time()
 avg_time_ms_unfused_matmul = (end - start) / iters * 1000
