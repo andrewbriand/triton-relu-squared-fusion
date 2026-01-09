@@ -144,7 +144,7 @@ def matmul_kernel_tma_persistent(a_desc, b_desc, c_desc, c_post_desc,  #
                                  NUM_SMS: tl.constexpr,  #
                                  WARP_SPECIALIZE: tl.constexpr,  #
                                  ):
-    dtype = tl.float8e4nv if FP8_OUTPUT else tl.float16
+    dtype = tl.float8e4nv if FP8_OUTPUT else tl.bfloat16
     start_pid = tl.program_id(axis=0)
     num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
@@ -483,8 +483,8 @@ class FusedLinearReLUSquareFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, W1, W2):
         range_push("fused fwd")
-        pre, post = forward_kernel(x, W1.T)
-        #pre, post = matmul_tma_persistent(x, W1, False)
+        #pre, post = forward_kernel(x, W1.T)
+        pre, post = matmul_tma_persistent(x, W1, False)
         x3 = post @ W2.T
         ctx.save_for_backward(x, W1, W2, pre, post)
         range_pop()
@@ -566,12 +566,14 @@ tflops_h100 = 989
 for i in range(5):
     pre, post = matmul_tma_persistent(x, W1, False)
 
+torch.cuda.cudart().cudaProfilerStart()
 torch.cuda.synchronize()
 start = time.time()
 for i in range(iters):
    pre, post = matmul_tma_persistent(x, W1, False)
 torch.cuda.synchronize()
 end = time.time()
+torch.cuda.cudart().cudaProfilerStop()
 
 avg_time_ms = (end - start) / iters * 1000
 print("Average fwd time (ms):", avg_time_ms)
