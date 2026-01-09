@@ -6,7 +6,8 @@ from torch.cuda.nvtx import range_push, range_pop
 import time
 from triton.tools.tensor_descriptor import TensorDescriptor
 
-batch = 24 * 2048 * 8
+#batch = 24 * 2048 * 8
+batch = 24 * 2048
 dim = 768
 hdim = 4 * dim
 
