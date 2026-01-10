@@ -25,7 +25,7 @@ def reference(x, W1, W2):
   return x3
 
 @triton.jit
-def matmul_kernel_tma_persistent(a_desc, b_desc, c_desc, aux_desc,  #
+def linear_relu_square_kernel(a_desc, b_desc, c_desc, aux_desc,  #
                                  M, N, K,  #
                                  BLOCK_SIZE_M: tl.constexpr,  #
                                  BLOCK_SIZE_N: tl.constexpr,  #
@@ -92,7 +92,7 @@ def matmul_kernel_tma_persistent(a_desc, b_desc, c_desc, aux_desc,  #
             aux_desc.store([offs_am_c, offs_bn_c + BLOCK_SIZE_N // 2], c1_post)
 
 
-def matmul_tma_persistent(a, b, aux=None):
+def linear_relu_square(a, b, aux=None):
     # Check constraints.
     assert a.shape[1] == b.shape[1], "Incompatible dimensions"  # b is transposed
     assert a.dtype == b.dtype, "Incompatible dtypes"
@@ -127,7 +127,7 @@ def matmul_tma_persistent(a, b, aux=None):
             triton.cdiv(M, BLOCK_SIZE_M) * triton.cdiv(N, BLOCK_SIZE_N),
         ), )
 
-    matmul_kernel_tma_persistent[grid](
+    linear_relu_square_kernel[grid](
         a_desc, b_desc, c_desc, aux_desc,#
         M, N, K,  #
         BLOCK_SIZE_M=BLOCK_SIZE_M,
@@ -149,7 +149,7 @@ class FusedLinearReLUSquareFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, W1, W2):
         range_push("fused fwd")
-        pre, post = matmul_tma_persistent(x, W1)
+        pre, post = linear_relu_square(x, W1)
         x3 = post @ W2
         ctx.save_for_backward(x, W1, W2, pre, post)
         range_pop()
@@ -173,7 +173,7 @@ class FusedLinearReLUSquareFunction(torch.autograd.Function):
         #dpost = grad_output @ W2
         #dpre = 2 * dpost * F.relu(pre)
         #dpre = bwd_kernel(grad_output, W2, pre)
-        dpre = matmul_tma_persistent(grad_output, W2, aux=pre)
+        dpre = linear_relu_square(grad_output, W2, aux=pre)
 
         # dpre is [batch x hdim]
         # x is [batch x dim]
@@ -234,13 +234,13 @@ bw_h100_gb_s = 3350
 tflops_h100 = 989
 
 for i in range(5):
-    pre, post = matmul_tma_persistent(x, W1)
+    pre, post = linear_relu_square(x, W1)
 
 torch.cuda.cudart().cudaProfilerStart()
 torch.cuda.synchronize()
 start = time.time()
 for i in range(iters):
-   pre, post = matmul_tma_persistent(x, W1)
+   pre, post = linear_relu_square(x, W1)
 torch.cuda.synchronize()
 end = time.time()
 torch.cuda.cudart().cudaProfilerStop()
@@ -298,7 +298,7 @@ torch.cuda.synchronize()
 
 start = time.time()
 for i in range(iters):
-  matmul_tma_persistent(grad_out, W2, aux=pre)
+  linear_relu_square(grad_out, W2, aux=pre)
 torch.cuda.synchronize()
 end = time.time()
 
