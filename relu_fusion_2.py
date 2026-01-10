@@ -33,44 +33,6 @@ def reference(x, W1, W2):
   range_pop()
   return x3
 
-def matmul_get_configs(pre_hook=None):
-    return [
-        triton.Config({'BLOCK_SIZE_M': BM, 'BLOCK_SIZE_N': BN, "BLOCK_SIZE_K": BK, "GROUP_SIZE_M": 8}, num_stages=s,
-                      num_warps=w, pre_hook=pre_hook)
-        for BM in [128]
-        for BN in [128, 256]
-        for BK in [64, 128]
-        for s in ([2, 3, 4])
-        for w in [4, 8]
-    ]
-
-def matmul_tma_set_block_size_hook(nargs):
-    BLOCK_M = nargs["BLOCK_SIZE_M"]
-    BLOCK_N = nargs["BLOCK_SIZE_N"]
-    BLOCK_K = nargs["BLOCK_SIZE_K"]
-    nargs["a_desc"].block_shape = [BLOCK_M, BLOCK_K]
-    nargs["b_desc"].block_shape = [BLOCK_N, BLOCK_K]
-    nargs["c_desc"].block_shape = [BLOCK_M, BLOCK_N // 2]
-    nargs["aux_desc"].block_shape = [BLOCK_M, BLOCK_N // 2]
-
-def matmul_tma_persistent_get_configs(pre_hook=None):
-    return [
-        triton.Config(
-            {
-                'BLOCK_SIZE_M': BM, 'BLOCK_SIZE_N': BN, "BLOCK_SIZE_K": BK, "GROUP_SIZE_M": 8
-            }, num_stages=s, num_warps=w, pre_hook=pre_hook)  #
-        for BM in [128]  #
-        for BN in [128, 256]  #
-        for BK in [64, 128]  #
-        for s in ([2, 3, 4])  #
-        for w in [4, 8]  #
-    ]
-
-
-@triton.autotune(
-    configs=matmul_tma_persistent_get_configs(pre_hook=matmul_tma_set_block_size_hook),
-    key=["M", "N", "K", "FORWARD"],
-)
 @triton.jit
 def matmul_kernel_tma_persistent(a_desc, b_desc, c_desc, aux_desc,  #
                                  M, N, K,  #
@@ -156,28 +118,35 @@ def matmul_tma_persistent(a, b, aux=None):
 
     NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
 
-    # A dummy block value that will be overwritten when we have the real block size
-    dummy_block = [1, 1]
-    a_desc = TensorDescriptor.from_tensor(a, dummy_block)
-    b_desc = TensorDescriptor.from_tensor(b, dummy_block)
-    c_desc = TensorDescriptor.from_tensor(c, dummy_block)
-    aux_desc = TensorDescriptor.from_tensor(aux, dummy_block)
+    BLOCK_SIZE_M = 128
+    BLOCK_SIZE_N = 256
+    BLOCK_SIZE_K = 64
+    num_stages = 4 if FORWARD else 3
+    num_warps = 8
+
+    a_desc = TensorDescriptor.from_tensor(a, [BLOCK_SIZE_M, BLOCK_SIZE_K])
+    b_desc = TensorDescriptor.from_tensor(b, [BLOCK_SIZE_N, BLOCK_SIZE_K])
+    c_desc = TensorDescriptor.from_tensor(c, [BLOCK_SIZE_M, BLOCK_SIZE_N // 2])
+    aux_desc = TensorDescriptor.from_tensor(aux, [BLOCK_SIZE_M, BLOCK_SIZE_N // 2])
 
     def grid(META):
-        nonlocal a_desc, b_desc, c_desc, aux_desc
-        BLOCK_M = META["BLOCK_SIZE_M"]
-        BLOCK_N = META["BLOCK_SIZE_N"]
         return (min(
             NUM_SMS,
-            triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N),
+            triton.cdiv(M, BLOCK_SIZE_M) * triton.cdiv(N, BLOCK_SIZE_N),
         ), )
 
     matmul_kernel_tma_persistent[grid](
         a_desc, b_desc, c_desc, aux_desc,#
         M, N, K,  #
+        BLOCK_SIZE_M=BLOCK_SIZE_M,
+        BLOCK_SIZE_N=BLOCK_SIZE_N,
+        BLOCK_SIZE_K=BLOCK_SIZE_K,
+        GROUP_SIZE_M=1,
         FP8_OUTPUT=dtype == torch.float8_e4m3fn,  #
         NUM_SMS=NUM_SMS,  #
-        FORWARD=FORWARD
+        FORWARD=FORWARD,
+        num_stages=num_stages,
+        num_warps=num_warps
     )
 
     if FORWARD:
