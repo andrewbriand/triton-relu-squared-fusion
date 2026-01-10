@@ -31,11 +31,10 @@ def matmul_kernel_tma_persistent(a_desc, b_desc, c_desc, aux_desc,  #
                                  BLOCK_SIZE_N: tl.constexpr,  #
                                  BLOCK_SIZE_K: tl.constexpr,  #
                                  GROUP_SIZE_M: tl.constexpr,  #
-                                 FP8_OUTPUT: tl.constexpr,  #
                                  NUM_SMS: tl.constexpr,  #
                                  FORWARD: tl.constexpr,
                                  ):
-    dtype = tl.float8e4nv if FP8_OUTPUT else tl.bfloat16
+    dtype = tl.bfloat16
     start_pid = tl.program_id(axis=0)
     num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
@@ -135,7 +134,6 @@ def matmul_tma_persistent(a, b, aux=None):
         BLOCK_SIZE_N=BLOCK_SIZE_N,
         BLOCK_SIZE_K=BLOCK_SIZE_K,
         GROUP_SIZE_M=1,
-        FP8_OUTPUT=dtype == torch.float8_e4m3fn,  #
         NUM_SMS=NUM_SMS,  #
         FORWARD=FORWARD,
         num_stages=num_stages,
