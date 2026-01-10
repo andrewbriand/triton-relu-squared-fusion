@@ -10,15 +10,6 @@ batch = 24 * 2048
 dim = 768
 hdim = 4 * dim
 
-@triton.jit
-def _compute_pid(tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M, NUM_SMS):
-    group_id = tile_id // num_pid_in_group
-    first_pid_m = group_id * GROUP_SIZE_M
-    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
-    pid_m = first_pid_m + (tile_id % group_size_m)
-    pid_n = (tile_id % num_pid_in_group) // group_size_m
-    return pid_m, pid_n
-
 dtype = torch.bfloat16
 
 x = torch.randn((batch, dim), dtype=dtype, device="cuda")
@@ -55,7 +46,8 @@ def matmul_kernel_tma_persistent(a_desc, b_desc, c_desc, aux_desc,  #
     num_pid_in_group = GROUP_SIZE_M * num_pid_n
 
     for tile_id in tl.range(start_pid, num_tiles, NUM_SMS, flatten=True):
-        pid_m, pid_n = _compute_pid(tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M, NUM_SMS)
+        pid_m = tile_id // num_pid_n
+        pid_n = tile_id % num_pid_n
         offs_am = pid_m * BLOCK_SIZE_M
         offs_bn = pid_n * BLOCK_SIZE_N
 
@@ -67,7 +59,8 @@ def matmul_kernel_tma_persistent(a_desc, b_desc, c_desc, aux_desc,  #
             accumulator = tl.dot(a, b.T, accumulator)
 
         tile_id_c += NUM_SMS
-        pid_m, pid_n = _compute_pid(tile_id_c, num_pid_in_group, num_pid_m, GROUP_SIZE_M, NUM_SMS)
+        pid_m = tile_id // num_pid_n
+        pid_n = tile_id % num_pid_n
         offs_am_c = pid_m * BLOCK_SIZE_M
         offs_bn_c = pid_n * BLOCK_SIZE_N
 
