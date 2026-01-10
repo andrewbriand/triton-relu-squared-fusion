@@ -23,13 +23,13 @@ dtype = torch.bfloat16
 
 x = torch.randn((batch, dim), dtype=dtype, device="cuda")
 W1 = torch.randn((hdim, dim), dtype=dtype, device="cuda")
-W2 = torch.randn((dim, hdim), dtype=dtype, device="cuda")
+W2 = torch.randn((hdim, dim), dtype=dtype, device="cuda")
 
 def reference(x, W1, W2):
   range_push("Unfused forward")
   x1 = x @ W1.T
   x2 = F.relu(x1).square()
-  x3 = x2 @ W2.T
+  x3 = x2 @ W2
   range_pop()
   return x3
 
@@ -110,7 +110,7 @@ def matmul_tma_persistent_get_configs(pre_hook=None):
 
 @triton.autotune(
     configs=matmul_tma_persistent_get_configs(pre_hook=matmul_tma_set_block_size_hook),
-    key=["M", "N", "K"],
+    key=["M", "N", "K", "FORWARD"],
 )
 @triton.jit
 def matmul_kernel_tma_persistent(a_desc, b_desc, c_desc, aux_desc,  #
@@ -179,7 +179,7 @@ def matmul_kernel_tma_persistent(a_desc, b_desc, c_desc, aux_desc,  #
             aux_desc.store([offs_am_c, offs_bn_c + BLOCK_SIZE_N // 2], c1_post)
 
 
-def matmul_tma_persistent(a, b):
+def matmul_tma_persistent(a, b, aux=None):
     # Check constraints.
     assert a.shape[1] == b.shape[1], "Incompatible dimensions"  # b is transposed
     assert a.dtype == b.dtype, "Incompatible dtypes"
@@ -189,7 +189,11 @@ def matmul_tma_persistent(a, b):
     dtype = a.dtype
 
     c = torch.empty((M, N), device=a.device, dtype=dtype)
-    c_post = torch.empty((M, N), device=a.device, dtype=dtype)
+
+    FORWARD = False
+    if aux is None:
+        FORWARD = True
+        aux = torch.empty((M, N), device=a.device, dtype=dtype)
 
     NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
 
@@ -198,10 +202,10 @@ def matmul_tma_persistent(a, b):
     a_desc = TensorDescriptor.from_tensor(a, dummy_block)
     b_desc = TensorDescriptor.from_tensor(b, dummy_block)
     c_desc = TensorDescriptor.from_tensor(c, dummy_block)
-    c_post_desc = TensorDescriptor.from_tensor(c_post, dummy_block)
+    aux_desc = TensorDescriptor.from_tensor(aux, dummy_block)
 
     def grid(META):
-        nonlocal a_desc, b_desc, c_desc, c_post_desc
+        nonlocal a_desc, b_desc, c_desc, aux_desc
         BLOCK_M = META["BLOCK_SIZE_M"]
         BLOCK_N = META["BLOCK_SIZE_N"]
         return (min(
@@ -210,13 +214,17 @@ def matmul_tma_persistent(a, b):
         ), )
 
     matmul_kernel_tma_persistent[grid](
-        a_desc, b_desc, c_desc, c_post_desc,#
+        a_desc, b_desc, c_desc, aux_desc,#
         M, N, K,  #
         FP8_OUTPUT=dtype == torch.float8_e4m3fn,  #
         NUM_SMS=NUM_SMS,  #
-        FORWARD=True
+        FORWARD=FORWARD
     )
-    return c, c_post
+
+    if FORWARD:
+        return c, aux
+    else:
+        return c
 
 # `triton.jit`'ed functions can be auto-tuned by using the `triton.autotune` decorator, which consumes:
 #   - A list of `triton.Config` objects that define different configurations of
@@ -464,7 +472,7 @@ class FusedLinearReLUSquareFunction(torch.autograd.Function):
         range_push("fused fwd")
         #pre, post = forward_kernel(x, W1.T)
         pre, post = matmul_tma_persistent(x, W1)
-        x3 = post @ W2.T
+        x3 = post @ W2
         ctx.save_for_backward(x, W1, W2, pre, post)
         range_pop()
         return x3
@@ -476,17 +484,18 @@ class FusedLinearReLUSquareFunction(torch.autograd.Function):
 
         # grad_output is [batch x dim]
         # post is [batch x hdim]
-        # dW2 is dim x hdim
-        dW2 = grad_output.T @ post
+        # dW2 is hdim x dim
+        dW2 = post.T @ grad_output
 
         # d / dx (relu(x))^2
         # 2 * relu(x) * (x > 0)
         # grad_output is [batch x dim]
-        # W2 is [dim x hdim]
+        # W2 is [hdim x dim]
         # dpost is [batch x hdim]
         #dpost = grad_output @ W2
         #dpre = 2 * dpost * F.relu(pre)
-        dpre = bwd_kernel(grad_output, W2, pre)
+        #dpre = bwd_kernel(grad_output, W2, pre)
+        dpre = matmul_tma_persistent(grad_output, W2, aux=pre)
 
         # dpre is [batch x hdim]
         # x is [batch x dim]
@@ -600,7 +609,7 @@ time.sleep(3)
 torch.cuda.synchronize()
 start = time.time()
 for i in range(iters):
-   pre = grad_out @ W2
+   pre = grad_out @ W2.T
 torch.cuda.synchronize()
 end = time.time()
 avg_time_ms_unfused_matmul = (end - start) / iters * 1000
@@ -611,7 +620,7 @@ torch.cuda.synchronize()
 
 start = time.time()
 for i in range(iters):
-  bwd_kernel(grad_out, W2, pre)
+  matmul_tma_persistent(grad_out, W2, aux=pre)
 torch.cuda.synchronize()
 end = time.time()
 
