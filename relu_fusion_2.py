@@ -6,23 +6,9 @@ from torch.cuda.nvtx import range_push, range_pop
 import time
 from triton.tools.tensor_descriptor import TensorDescriptor
 
-#batch = 24 * 2048 * 8
 batch = 24 * 2048
 dim = 768
 hdim = 4 * dim
-
-def _matmul_launch_metadata(grid, kernel, args):
-    ret = {}
-    M, N, K, WS = args["M"], args["N"], args["K"], args.get("WARP_SPECIALIZE", False)
-    ws_str = "_ws" if WS else ""
-    ret["name"] = f"{kernel.name}{ws_str} [M={M}, N={N}, K={K}]"
-    if "c_ptr" in args:
-        bytes_per_elem = args["c_ptr"].element_size()
-    else:
-        bytes_per_elem = 1 if args["FP8_OUTPUT"] else 2
-    ret[f"flops{bytes_per_elem * 8}"] = 2. * M * N * K
-    ret["bytes"] = bytes_per_elem * (M * K + N * K + M * N)
-    return ret
 
 @triton.jit
 def _compute_pid(tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M, NUM_SMS):
@@ -100,50 +86,42 @@ def matmul_get_configs(pre_hook=None):
     ]
 
 def matmul_tma_set_block_size_hook(nargs):
-    EPILOGUE_SUBTILE = nargs.get("EPILOGUE_SUBTILE", False)
     BLOCK_M = nargs["BLOCK_SIZE_M"]
     BLOCK_N = nargs["BLOCK_SIZE_N"]
     BLOCK_K = nargs["BLOCK_SIZE_K"]
     nargs["a_desc"].block_shape = [BLOCK_M, BLOCK_K]
     nargs["b_desc"].block_shape = [BLOCK_N, BLOCK_K]
-    if EPILOGUE_SUBTILE:
-        nargs["c_desc"].block_shape = [BLOCK_M, BLOCK_N // 2]
-        nargs["c_post_desc"].block_shape = [BLOCK_M, BLOCK_N // 2]
-    else:
-        nargs["c_desc"].block_shape = [BLOCK_M, BLOCK_N]
-        nargs["c_post_desc"].block_shape = [BLOCK_M, BLOCK_N]
+    nargs["c_desc"].block_shape = [BLOCK_M, BLOCK_N // 2]
+    nargs["aux_desc"].block_shape = [BLOCK_M, BLOCK_N // 2]
 
 def matmul_tma_persistent_get_configs(pre_hook=None):
     return [
         triton.Config(
             {
-                'BLOCK_SIZE_M': BM, 'BLOCK_SIZE_N': BN, "BLOCK_SIZE_K": BK, "GROUP_SIZE_M": 8, "EPILOGUE_SUBTILE":
-                SUBTILE
+                'BLOCK_SIZE_M': BM, 'BLOCK_SIZE_N': BN, "BLOCK_SIZE_K": BK, "GROUP_SIZE_M": 8
             }, num_stages=s, num_warps=w, pre_hook=pre_hook)  #
         for BM in [128]  #
         for BN in [128, 256]  #
         for BK in [64, 128]  #
         for s in ([2, 3, 4])  #
         for w in [4, 8]  #
-        for SUBTILE in [True, False]  #
     ]
 
 
 @triton.autotune(
     configs=matmul_tma_persistent_get_configs(pre_hook=matmul_tma_set_block_size_hook),
-    key=["M", "N", "K", "WARP_SPECIALIZE"],
+    key=["M", "N", "K"],
 )
-@triton.jit(launch_metadata=_matmul_launch_metadata)
-def matmul_kernel_tma_persistent(a_desc, b_desc, c_desc, c_post_desc,  #
+@triton.jit
+def matmul_kernel_tma_persistent(a_desc, b_desc, c_desc, aux_desc,  #
                                  M, N, K,  #
                                  BLOCK_SIZE_M: tl.constexpr,  #
                                  BLOCK_SIZE_N: tl.constexpr,  #
                                  BLOCK_SIZE_K: tl.constexpr,  #
                                  GROUP_SIZE_M: tl.constexpr,  #
                                  FP8_OUTPUT: tl.constexpr,  #
-                                 EPILOGUE_SUBTILE: tl.constexpr,  #
                                  NUM_SMS: tl.constexpr,  #
-                                 WARP_SPECIALIZE: tl.constexpr,  #
+                                 FORWARD: tl.constexpr,
                                  ):
     dtype = tl.float8e4nv if FP8_OUTPUT else tl.bfloat16
     start_pid = tl.program_id(axis=0)
@@ -155,10 +133,7 @@ def matmul_kernel_tma_persistent(a_desc, b_desc, c_desc, c_post_desc,  #
     tile_id_c = start_pid - NUM_SMS
     num_pid_in_group = GROUP_SIZE_M * num_pid_n
 
-    # Enable warp specialization to leverage async warp scheduling in the GPU.
-    # FIXME: This only works on Blackwell right now. On older GPUs, this will
-    # use software pipelining.
-    for tile_id in tl.range(start_pid, num_tiles, NUM_SMS, flatten=True, warp_specialize=WARP_SPECIALIZE):
+    for tile_id in tl.range(start_pid, num_tiles, NUM_SMS, flatten=True):
         pid_m, pid_n = _compute_pid(tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M, NUM_SMS)
         offs_am = pid_m * BLOCK_SIZE_M
         offs_bn = pid_n * BLOCK_SIZE_N
@@ -175,33 +150,36 @@ def matmul_kernel_tma_persistent(a_desc, b_desc, c_desc, c_post_desc,  #
         offs_am_c = pid_m * BLOCK_SIZE_M
         offs_bn_c = pid_n * BLOCK_SIZE_N
 
-        # Epilogue subtiling is a technique to break our computation and stores into multiple pieces
-        # By subtiling we can reduce shared memory consumption by the epilogue and instead use that
-        # memory to increase our stage count.
-        # In this case we partition the accumulator into 2 BLOCK_SIZE_M x BLOCK_SIZE_N // 2 tensors
-        if EPILOGUE_SUBTILE:
-            acc = tl.reshape(accumulator, (BLOCK_SIZE_M, 2, BLOCK_SIZE_N // 2))
-            acc = tl.permute(acc, (0, 2, 1))
-            acc0, acc1 = tl.split(acc)
-            c0 = acc0.to(dtype)
+        acc = tl.reshape(accumulator, (BLOCK_SIZE_M, 2, BLOCK_SIZE_N // 2))
+        acc = tl.permute(acc, (0, 2, 1))
+        acc0, acc1 = tl.split(acc)
+
+        c0 = acc0.to(dtype)
+        if not FORWARD:
+            c0_pre = aux_desc.load([offs_am_c, offs_bn_c])
+            c0 = 2 * c0 * tl.where(c0_pre > 0, c0_pre, 0)
+
+        c_desc.store([offs_am_c, offs_bn_c], c0)
+
+        if FORWARD:
             c0_post = tl.maximum(c0, 0)
             c0_post = c0_post * c0_post
-            c_desc.store([offs_am_c, offs_bn_c], c0)
-            c_post_desc.store([offs_am_c, offs_bn_c], c0_post)
-            c1 = acc1.to(dtype)
+            aux_desc.store([offs_am_c, offs_bn_c], c0_post)
+
+        c1 = acc1.to(dtype)
+        if not FORWARD:
+            c1_pre = aux_desc.load([offs_am_c, offs_bn_c + BLOCK_SIZE_N // 2])
+            c1 = 2 * c1 * tl.where(c1_pre > 0, c1_pre, 0)
+
+        c_desc.store([offs_am_c, offs_bn_c + BLOCK_SIZE_N // 2], c1)
+
+        if FORWARD:
             c1_post = tl.maximum(c1, 0)
             c1_post = c1_post * c1_post
-            c_desc.store([offs_am_c, offs_bn_c + BLOCK_SIZE_N // 2], c1)
-            c_post_desc.store([offs_am_c, offs_bn_c + BLOCK_SIZE_N // 2], c1_post)
-        else:
-            accumulator = accumulator.to(dtype)
-            c_desc.store([offs_am_c, offs_bn_c], accumulator)
-            post = tl.maximum(accumulator, 0)
-            post = post * post 
-            c_post_desc.store([offs_am_c, offs_bn_c], post)
+            aux_desc.store([offs_am_c, offs_bn_c + BLOCK_SIZE_N // 2], c1_post)
 
 
-def matmul_tma_persistent(a, b, warp_specialize: bool):
+def matmul_tma_persistent(a, b):
     # Check constraints.
     assert a.shape[1] == b.shape[1], "Incompatible dimensions"  # b is transposed
     assert a.dtype == b.dtype, "Incompatible dtypes"
@@ -236,7 +214,7 @@ def matmul_tma_persistent(a, b, warp_specialize: bool):
         M, N, K,  #
         FP8_OUTPUT=dtype == torch.float8_e4m3fn,  #
         NUM_SMS=NUM_SMS,  #
-        WARP_SPECIALIZE=warp_specialize,  #
+        FORWARD=True
     )
     return c, c_post
 
@@ -485,7 +463,7 @@ class FusedLinearReLUSquareFunction(torch.autograd.Function):
     def forward(ctx, x, W1, W2):
         range_push("fused fwd")
         #pre, post = forward_kernel(x, W1.T)
-        pre, post = matmul_tma_persistent(x, W1, False)
+        pre, post = matmul_tma_persistent(x, W1)
         x3 = post @ W2.T
         ctx.save_for_backward(x, W1, W2, pre, post)
         range_pop()
@@ -546,9 +524,15 @@ out_kernel.backward(grad_out)
 
 torch.testing.assert_close(out_ref, out_kernel)
 
+print("Max abs diff out: ", torch.max(torch.abs(out_ref - out_kernel)))
+
 torch.testing.assert_close(W2_ref.grad, W2_kernel.grad)
 torch.testing.assert_close(W1_ref.grad, W1_kernel.grad)
 torch.testing.assert_close(x_ref.grad, x_kernel.grad)
+
+print("Max abs diff W2:", torch.max(torch.abs(W2_ref.grad - W2_kernel.grad)))
+print("Max abs diff W1:", torch.max(torch.abs(W1_ref.grad - W1_kernel.grad)))
+print("Max abs diff x:", torch.max(torch.abs(x_ref.grad - x_kernel.grad)))
 
 print("PASS")
 
@@ -561,17 +545,15 @@ tflops_4090 = 165.2
 
 bw_h100_gb_s = 3350
 tflops_h100 = 989
-  
-
 
 for i in range(5):
-    pre, post = matmul_tma_persistent(x, W1, False)
+    pre, post = matmul_tma_persistent(x, W1)
 
 torch.cuda.cudart().cudaProfilerStart()
 torch.cuda.synchronize()
 start = time.time()
 for i in range(iters):
-   pre, post = matmul_tma_persistent(x, W1, False)
+   pre, post = matmul_tma_persistent(x, W1)
 torch.cuda.synchronize()
 end = time.time()
 torch.cuda.cudart().cudaProfilerStop()
@@ -611,6 +593,18 @@ print("Forward TFLOPS:", fwd_tflops)
 print("Forward TFLOPS util RTX 4090 (%):", fwd_tflops_util)
 print("Forward TFLOPS util H100 (%):", fwd_tflops_util_h100)
 print()
+
+time.sleep(3)
+
+# unfused matmul time
+torch.cuda.synchronize()
+start = time.time()
+for i in range(iters):
+   pre = grad_out @ W2
+torch.cuda.synchronize()
+end = time.time()
+avg_time_ms_unfused_matmul = (end - start) / iters * 1000
+print("Average unfused matmul time bwd (ms):", avg_time_ms_unfused_matmul)
 
 # Benchmark bwd
 torch.cuda.synchronize()
