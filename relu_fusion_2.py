@@ -4,321 +4,153 @@ import triton
 import triton.language as tl
 from torch.cuda.nvtx import range_push, range_pop
 import time
+from triton.tools.tensor_descriptor import TensorDescriptor
 
-batch = 24 * 2048 * 8
+batch = 24 * 2048
 dim = 768
 hdim = 4 * dim
 
 dtype = torch.bfloat16
 
 x = torch.randn((batch, dim), dtype=dtype, device="cuda")
-W1 = torch.randn((dim, hdim), dtype=dtype, device="cuda")
-W2 = torch.randn((dim, hdim), dtype=dtype, device="cuda")
+W1 = torch.randn((hdim, dim), dtype=dtype, device="cuda")
+W2 = torch.randn((hdim, dim), dtype=dtype, device="cuda")
 
 def reference(x, W1, W2):
   range_push("Unfused forward")
-  x1 = x @ W1
+  x1 = x @ W1.T
   x2 = F.relu(x1).square()
-  x3 = x2 @ W2.T
+  x3 = x2 @ W2
   range_pop()
   return x3
 
-def get_cuda_autotune_config():
-    return [
-        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8}, num_stages=3,
-                      num_warps=8),
-        triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4,
-                      num_warps=4),
-        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4,
-                      num_warps=4),
-        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4,
-                      num_warps=4),
-        triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4,
-                      num_warps=4),
-        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4,
-                      num_warps=4),
-        triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=5,
-                      num_warps=2),
-        triton.Config({'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=5,
-                      num_warps=2),
-        # Good config for fp8 inputs.
-        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 128, 'GROUP_SIZE_M': 8}, num_stages=3,
-                      num_warps=8),
-        triton.Config({'BLOCK_SIZE_M': 256, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 128, 'GROUP_SIZE_M': 8}, num_stages=3,
-                      num_warps=8),
-        triton.Config({'BLOCK_SIZE_M': 256, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 128, 'GROUP_SIZE_M': 8}, num_stages=4,
-                      num_warps=4),
-        triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 128, 'GROUP_SIZE_M': 8}, num_stages=4,
-                      num_warps=4),
-        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 128, 'GROUP_SIZE_M': 8}, num_stages=4,
-                      num_warps=4),
-        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8}, num_stages=4,
-                      num_warps=4),
-        triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8}, num_stages=4,
-                      num_warps=4),
-        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8}, num_stages=4,
-                      num_warps=4)
-    ]
-
-
-def get_autotune_config():
-    return get_cuda_autotune_config()
-
-# We can fuse `leaky_relu` by providing it as an `ACTIVATION` meta-parameter in `matmul_kernel`.
 @triton.jit
-def relu_squared(x):
-    relu = tl.where(x >= 0, x, 0)
-    return relu * relu
-
-# `triton.jit`'ed functions can be auto-tuned by using the `triton.autotune` decorator, which consumes:
-#   - A list of `triton.Config` objects that define different configurations of
-#       meta-parameters (e.g., `BLOCK_SIZE_M`) and compilation options (e.g., `num_warps`) to try
-#   - An auto-tuning *key* whose change in values will trigger evaluation of all the
-#       provided configs
-@triton.autotune(
-    configs=get_autotune_config()[:1],
-    key=['M', 'N', 'K'],
-)
-@triton.jit
-def matmul_kernel(
-        # Pointers to matrices
-        a_ptr, b_ptr, c_ptr, c_pre_ptr,
-        # Matrix dimensions
-        M, N, K,
-        # The stride variables represent how much to increase the ptr by when moving by 1
-        # element in a particular dimension. E.g. `stride_am` is how much to increase `a_ptr`
-        # by to get the element one row down (A has M rows).
-        stride_am, stride_ak,  #
-        stride_bk, stride_bn,  #
-        stride_cm, stride_cn,
-        # Meta-parameters
-        BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr,  #
-        GROUP_SIZE_M: tl.constexpr,  #
-):
-    """Kernel for computing the matmul C = A x B.
-    A has shape (M, K), B has shape (K, N) and C has shape (M, N)
-    """
-    # -----------------------------------------------------------
-    # Map program ids `pid` to the block of C it should compute.
-    # This is done in a grouped ordering to promote L2 data reuse.
-    # See above `L2 Cache Optimizations` section for details.
-    pid = tl.program_id(axis=0)
+def linear_relu_square_kernel(a_desc, b_desc, c_desc, aux_desc,  #
+                                 M, N, K,  #
+                                 BLOCK_SIZE_M: tl.constexpr,  #
+                                 BLOCK_SIZE_N: tl.constexpr,  #
+                                 BLOCK_SIZE_K: tl.constexpr,  #
+                                 GROUP_SIZE_M: tl.constexpr,  #
+                                 NUM_SMS: tl.constexpr,  #
+                                 FORWARD: tl.constexpr,
+                                 ):
+    dtype = tl.bfloat16
+    start_pid = tl.program_id(axis=0)
     num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    k_tiles = tl.cdiv(K, BLOCK_SIZE_K)
+    num_tiles = num_pid_m * num_pid_n
+
+    tile_id_c = start_pid - NUM_SMS
     num_pid_in_group = GROUP_SIZE_M * num_pid_n
-    group_id = pid // num_pid_in_group
-    first_pid_m = group_id * GROUP_SIZE_M
-    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
-    pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
-    pid_n = (pid % num_pid_in_group) // group_size_m
 
-    # -----------------------------------------------------------
-    # Add some integer bound assumptions.
-    # This helps to guide integer analysis in the backend to optimize
-    # load/store offset address calculation
-    tl.assume(pid_m >= 0)
-    tl.assume(pid_n >= 0)
-    tl.assume(stride_am > 0)
-    tl.assume(stride_ak > 0)
-    tl.assume(stride_bn > 0)
-    tl.assume(stride_bk > 0)
-    tl.assume(stride_cm > 0)
-    tl.assume(stride_cn > 0)
+    for tile_id in tl.range(start_pid, num_tiles, NUM_SMS, flatten=True):
+        pid_m = tile_id // num_pid_n
+        pid_n = tile_id % num_pid_n
+        offs_am = pid_m * BLOCK_SIZE_M
+        offs_bn = pid_n * BLOCK_SIZE_N
 
-    # ----------------------------------------------------------
-    # Create pointers for the first blocks of A and B.
-    # We will advance this pointer as we move in the K direction
-    # and accumulate
-    # `a_ptrs` is a block of [BLOCK_SIZE_M, BLOCK_SIZE_K] pointers
-    # `b_ptrs` is a block of [BLOCK_SIZE_K, BLOCK_SIZE_N] pointers
-    # See above `Pointer Arithmetic` section for details
-    offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
-    offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
-    offs_k = tl.arange(0, BLOCK_SIZE_K)
-    a_ptrs = a_ptr + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
-    b_ptrs = b_ptr + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
+        accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+        for ki in range(k_tiles):
+            offs_k = ki * BLOCK_SIZE_K
+            a = a_desc.load([offs_am, offs_k])
+            b = b_desc.load([offs_bn, offs_k])
+            accumulator = tl.dot(a, b.T, accumulator)
 
-    # -----------------------------------------------------------
-    # Iterate to compute a block of the C matrix.
-    # We accumulate into a `[BLOCK_SIZE_M, BLOCK_SIZE_N]` block
-    # of fp32 values for higher accuracy.
-    # `accumulator` will be converted back to fp16 after the loop.
-    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
-        # Load the next block of A and B, generate a mask by checking the K dimension.
-        # If it is out of bounds, set it to 0.
-        a = tl.load(a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_SIZE_K, other=0.0)
-        b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0)
-        # We accumulate along the K dimension.
-        accumulator = tl.dot(a, b, accumulator)
-        # Advance the ptrs to the next K block.
-        a_ptrs += BLOCK_SIZE_K * stride_ak
-        b_ptrs += BLOCK_SIZE_K * stride_bk
+        tile_id_c += NUM_SMS
+        pid_m = tile_id // num_pid_n
+        pid_n = tile_id % num_pid_n
+        offs_am_c = pid_m * BLOCK_SIZE_M
+        offs_bn_c = pid_n * BLOCK_SIZE_N
 
-    c_pre = accumulator.to(a_ptr.type.element_ty)
-    c_post = relu_squared(c_pre)
+        acc = tl.reshape(accumulator, (BLOCK_SIZE_M, 2, BLOCK_SIZE_N // 2))
+        acc = tl.permute(acc, (0, 2, 1))
+        acc0, acc1 = tl.split(acc)
 
-    # -----------------------------------------------------------
-    # Write back the block of the output matrix C with masks.
-    offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-    offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-    c_ptrs = c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
-    c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
-    tl.store(c_ptrs, c_post, mask=c_mask)
+        c0 = acc0.to(dtype)
+        if not FORWARD:
+            c0_pre = aux_desc.load([offs_am_c, offs_bn_c])
+            c0 = 2 * c0 * tl.where(c0_pre > 0, c0_pre, 0)
 
-    c_pre_ptrs = c_pre_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
-    tl.store(c_pre_ptrs, c_pre, mask=c_mask)
+        c_desc.store([offs_am_c, offs_bn_c], c0)
+
+        if FORWARD:
+            c0_post = tl.maximum(c0, 0)
+            c0_post = c0_post * c0_post
+            aux_desc.store([offs_am_c, offs_bn_c], c0_post)
+
+        c1 = acc1.to(dtype)
+        if not FORWARD:
+            c1_pre = aux_desc.load([offs_am_c, offs_bn_c + BLOCK_SIZE_N // 2])
+            c1 = 2 * c1 * tl.where(c1_pre > 0, c1_pre, 0)
+
+        c_desc.store([offs_am_c, offs_bn_c + BLOCK_SIZE_N // 2], c1)
+
+        if FORWARD:
+            c1_post = tl.maximum(c1, 0)
+            c1_post = c1_post * c1_post
+            aux_desc.store([offs_am_c, offs_bn_c + BLOCK_SIZE_N // 2], c1_post)
 
 
-def forward_kernel(a, b, activation=""):
+def linear_relu_square(a, b, aux=None):
     # Check constraints.
-    assert a.shape[1] == b.shape[0], "Incompatible dimensions"
-    assert a.is_contiguous(), "Matrix A must be contiguous"
+    assert a.shape[1] == b.shape[1], "Incompatible dimensions"  # b is transposed
+    assert a.dtype == b.dtype, "Incompatible dtypes"
+
     M, K = a.shape
-    K, N = b.shape
-    # Allocates output.
-    pre = torch.empty((M, N), device=a.device, dtype=a.dtype)
-    post = torch.empty((M, N), device=a.device, dtype=a.dtype)
-    # 1D launch kernel where each block gets its own program.
-    grid = lambda META: (triton.cdiv(M, META['BLOCK_SIZE_M']) * triton.cdiv(N, META['BLOCK_SIZE_N']), )
-    matmul_kernel[grid](
-        a, b, post, pre, #
+    N, K = b.shape
+    dtype = a.dtype
+
+    c = torch.empty((M, N), device=a.device, dtype=dtype)
+
+    FORWARD = False
+    if aux is None:
+        FORWARD = True
+        aux = torch.empty((M, N), device=a.device, dtype=dtype)
+
+    NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
+
+    BLOCK_SIZE_M = 128
+    BLOCK_SIZE_N = 256
+    BLOCK_SIZE_K = 64
+    num_stages = 4 if FORWARD else 3
+    num_warps = 8
+
+    a_desc = TensorDescriptor.from_tensor(a, [BLOCK_SIZE_M, BLOCK_SIZE_K])
+    b_desc = TensorDescriptor.from_tensor(b, [BLOCK_SIZE_N, BLOCK_SIZE_K])
+    c_desc = TensorDescriptor.from_tensor(c, [BLOCK_SIZE_M, BLOCK_SIZE_N // 2])
+    aux_desc = TensorDescriptor.from_tensor(aux, [BLOCK_SIZE_M, BLOCK_SIZE_N // 2])
+
+    def grid(META):
+        return (min(
+            NUM_SMS,
+            triton.cdiv(M, BLOCK_SIZE_M) * triton.cdiv(N, BLOCK_SIZE_N),
+        ), )
+
+    linear_relu_square_kernel[grid](
+        a_desc, b_desc, c_desc, aux_desc,#
         M, N, K,  #
-        a.stride(0), a.stride(1),  #
-        b.stride(0), b.stride(1),  #
-        post.stride(0), post.stride(1),  #
+        BLOCK_SIZE_M=BLOCK_SIZE_M,
+        BLOCK_SIZE_N=BLOCK_SIZE_N,
+        BLOCK_SIZE_K=BLOCK_SIZE_K,
+        GROUP_SIZE_M=1,
+        NUM_SMS=NUM_SMS,  #
+        FORWARD=FORWARD,
+        num_stages=num_stages,
+        num_warps=num_warps
     )
-    return pre, post
 
-@triton.autotune(
-    configs=get_autotune_config()[:1],
-    key=['M', 'N', 'K'],
-)
-@triton.jit
-def matmul_kernel_bwd(
-        # Pointers to matrices
-        a_ptr, b_ptr, c_ptr, c_pre_ptr,
-        # Matrix dimensions
-        M, N, K,
-        # The stride variables represent how much to increase the ptr by when moving by 1
-        # element in a particular dimension. E.g. `stride_am` is how much to increase `a_ptr`
-        # by to get the element one row down (A has M rows).
-        stride_am, stride_ak,  #
-        stride_bk, stride_bn,  #
-        stride_cm, stride_cn,
-        # Meta-parameters
-        BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr,  #
-        GROUP_SIZE_M: tl.constexpr,  #
-):
-    """Kernel for computing the matmul C = A x B.
-    A has shape (M, K), B has shape (K, N) and C has shape (M, N)
-    """
-    # -----------------------------------------------------------
-    # Map program ids `pid` to the block of C it should compute.
-    # This is done in a grouped ordering to promote L2 data reuse.
-    # See above `L2 Cache Optimizations` section for details.
-    pid = tl.program_id(axis=0)
-    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
-    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
-    num_pid_in_group = GROUP_SIZE_M * num_pid_n
-    group_id = pid // num_pid_in_group
-    first_pid_m = group_id * GROUP_SIZE_M
-    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
-    pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
-    pid_n = (pid % num_pid_in_group) // group_size_m
-
-    # -----------------------------------------------------------
-    # Add some integer bound assumptions.
-    # This helps to guide integer analysis in the backend to optimize
-    # load/store offset address calculation
-    tl.assume(pid_m >= 0)
-    tl.assume(pid_n >= 0)
-    tl.assume(stride_am > 0)
-    tl.assume(stride_ak > 0)
-    tl.assume(stride_bn > 0)
-    tl.assume(stride_bk > 0)
-    tl.assume(stride_cm > 0)
-    tl.assume(stride_cn > 0)
-
-    # ----------------------------------------------------------
-    # Create pointers for the first blocks of A and B.
-    # We will advance this pointer as we move in the K direction
-    # and accumulate
-    # `a_ptrs` is a block of [BLOCK_SIZE_M, BLOCK_SIZE_K] pointers
-    # `b_ptrs` is a block of [BLOCK_SIZE_K, BLOCK_SIZE_N] pointers
-    # See above `Pointer Arithmetic` section for details
-    offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
-    offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
-    offs_k = tl.arange(0, BLOCK_SIZE_K)
-    a_ptrs = a_ptr + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
-    b_ptrs = b_ptr + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
-
-    # -----------------------------------------------------------
-    # Iterate to compute a block of the C matrix.
-    # We accumulate into a `[BLOCK_SIZE_M, BLOCK_SIZE_N]` block
-    # of fp32 values for higher accuracy.
-    # `accumulator` will be converted back to fp16 after the loop.
-    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
-        # Load the next block of A and B, generate a mask by checking the K dimension.
-        # If it is out of bounds, set it to 0.
-        a = tl.load(a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_SIZE_K, other=0.0)
-        b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0)
-        # We accumulate along the K dimension.
-        accumulator = tl.dot(a, b, accumulator)
-        # Advance the ptrs to the next K block.
-        a_ptrs += BLOCK_SIZE_K * stride_ak
-        b_ptrs += BLOCK_SIZE_K * stride_bk
-
-    offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-    offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-    c_pre_ptrs = c_pre_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
-    c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
-
-    c_pre = tl.load(c_pre_ptrs, mask=c_mask)
-
-    dpost = accumulator.to(a_ptr.type.element_ty)
-    dpre = 2 * dpost * tl.where(c_pre > 0, c_pre, 0)
-
-    # -----------------------------------------------------------
-    # Write back the block of the output matrix C with masks.
-    c_ptrs = c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
-    tl.store(c_ptrs, dpre, mask=c_mask)
-
-def bwd_kernel(a, b, pre):
-    # Check constraints.
-    assert a.shape[1] == b.shape[0], "Incompatible dimensions"
-    assert a.is_contiguous(), "Matrix A must be contiguous"
-    M, K = a.shape
-    K, N = b.shape
-    assert(pre.shape == (M, N))
-    # Allocates output.
-    c = torch.empty((M, N), device=a.device, dtype=a.dtype)
-    assert pre.stride(0) == c.stride(0)
-    assert pre.stride(1) == c.stride(1)
-    # 1D launch kernel where each block gets its own program.
-    grid = lambda META: (triton.cdiv(M, META['BLOCK_SIZE_M']) * triton.cdiv(N, META['BLOCK_SIZE_N']), )
-    matmul_kernel_bwd[grid](
-        a, b, c, pre, #
-        M, N, K,  #
-        a.stride(0), a.stride(1),  #
-        b.stride(0), b.stride(1),  #
-        c.stride(0), c.stride(1),  #
-    )
-    return c
-
-
-def custom_kernels(x, W1, W2):
-  pre, x1 = forward_kernel(x, W1)
-  x3 = x1 @ W2.T
-  return pre, x3
+    if FORWARD:
+        return c, aux
+    else:
+        return c
 
 class FusedLinearReLUSquareFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, W1, W2):
         range_push("fused fwd")
-        pre, post = forward_kernel(x, W1)
-        x3 = post @ W2.T
+        pre, post = linear_relu_square(x, W1)
+        x3 = post @ W2
         ctx.save_for_backward(x, W1, W2, pre, post)
         range_pop()
         return x3
@@ -330,27 +162,28 @@ class FusedLinearReLUSquareFunction(torch.autograd.Function):
 
         # grad_output is [batch x dim]
         # post is [batch x hdim]
-        # dW2 is dim x hdim
-        dW2 = grad_output.T @ post
+        # dW2 is hdim x dim
+        dW2 = post.T @ grad_output
 
         # d / dx (relu(x))^2
         # 2 * relu(x) * (x > 0)
         # grad_output is [batch x dim]
-        # W2 is [dim x hdim]
+        # W2 is [hdim x dim]
         # dpost is [batch x hdim]
         #dpost = grad_output @ W2
         #dpre = 2 * dpost * F.relu(pre)
-        dpre = bwd_kernel(grad_output, W2, pre)
+        #dpre = bwd_kernel(grad_output, W2, pre)
+        dpre = linear_relu_square(grad_output, W2, aux=pre)
 
         # dpre is [batch x hdim]
         # x is [batch x dim]
-        # dW1 is [dim x hdim]
-        dW1 = x.T @ dpre
+        # dW1 is [hdim x dim]
+        dW1 = dpre.T @ x
 
         # dpre is [batch x hdim]
-        # W1 is [dim x hdim]
+        # W1 is [hdim x dim]
         # dx is [batch x dim]
-        dx = dpre @ W1.T
+        dx = dpre @ W1
 
         range_pop()
         
@@ -378,9 +211,15 @@ out_kernel.backward(grad_out)
 
 torch.testing.assert_close(out_ref, out_kernel)
 
+print("Max abs diff out: ", torch.max(torch.abs(out_ref - out_kernel)))
+
 torch.testing.assert_close(W2_ref.grad, W2_kernel.grad)
 torch.testing.assert_close(W1_ref.grad, W1_kernel.grad)
 torch.testing.assert_close(x_ref.grad, x_kernel.grad)
+
+print("Max abs diff W2:", torch.max(torch.abs(W2_ref.grad - W2_kernel.grad)))
+print("Max abs diff W1:", torch.max(torch.abs(W1_ref.grad - W1_kernel.grad)))
+print("Max abs diff x:", torch.max(torch.abs(x_ref.grad - x_kernel.grad)))
 
 print("PASS")
 
@@ -394,15 +233,30 @@ tflops_4090 = 165.2
 bw_h100_gb_s = 3350
 tflops_h100 = 989
 
+for i in range(5):
+    pre, post = linear_relu_square(x, W1)
+
+torch.cuda.cudart().cudaProfilerStart()
 torch.cuda.synchronize()
 start = time.time()
 for i in range(iters):
-   pre, post = forward_kernel(x, W1)
+   pre, post = linear_relu_square(x, W1)
 torch.cuda.synchronize()
 end = time.time()
+torch.cuda.cudart().cudaProfilerStop()
 
 avg_time_ms = (end - start) / iters * 1000
 print("Average fwd time (ms):", avg_time_ms)
+
+# unfused matmul time
+torch.cuda.synchronize()
+start = time.time()
+for i in range(iters):
+   pre = x @ W1.T
+torch.cuda.synchronize()
+end = time.time()
+avg_time_ms_unfused_matmul = (end - start) / iters * 1000
+print("Average unfused matmul time (ms):", avg_time_ms_unfused_matmul)
 
 fwd_traffic_input_elements = batch * dim + dim * hdim
 fwd_traffic_output_elements = 2 * batch * hdim
@@ -427,12 +281,24 @@ print("Forward TFLOPS util RTX 4090 (%):", fwd_tflops_util)
 print("Forward TFLOPS util H100 (%):", fwd_tflops_util_h100)
 print()
 
+time.sleep(3)
+
+# unfused matmul time
+torch.cuda.synchronize()
+start = time.time()
+for i in range(iters):
+   pre = grad_out @ W2.T
+torch.cuda.synchronize()
+end = time.time()
+avg_time_ms_unfused_matmul = (end - start) / iters * 1000
+print("Average unfused matmul time bwd (ms):", avg_time_ms_unfused_matmul)
+
 # Benchmark bwd
 torch.cuda.synchronize()
 
 start = time.time()
 for i in range(iters):
-  bwd_kernel(grad_out, W2, pre)
+  linear_relu_square(grad_out, W2, aux=pre)
 torch.cuda.synchronize()
 end = time.time()
 
