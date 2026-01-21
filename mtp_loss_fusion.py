@@ -17,6 +17,49 @@ logits = torch.randn((1, batch, N), dtype=dtype, device="cuda", requires_grad=Tr
 target_seq = torch.randint(0, N, (batch,), dtype=torch.int64, device="cuda")
 
 @triton.jit
+def fused_softcapped_entropy_fwd_kernel(
+    logits_ptr, losses_ptr, lse_ptr, targets_ptr, mtp_weights_ptr,
+    stride_logits_n, stride_logits_v,
+    n_rows, n_cols, n_predict,
+    A, B, C,
+    BLOCK_SIZE: tl.constexpr,
+    BLOCK_BATCH: tl.constexpr,
+):
+    row_idx = tl.program_id(0).to(tl.int64)
+    logits_row_ptr = logits_ptr + row_idx * stride_logits_n
+    
+    max_val = -float('inf')
+    sum_exp = 0.0
+    
+    for off in range(0, n_cols, BLOCK_SIZE):
+        cols = off + tl.arange(0, BLOCK_SIZE)
+        mask = cols < n_cols
+        val = tl.load(logits_row_ptr + cols, mask=mask, other=-float('inf')).to(tl.float32)
+        z = A * tl.sigmoid((val + B) / C)
+        z = tl.where(mask, z, -float('inf'))
+        curr_max = tl.max(z, axis=0)
+        new_max = tl.maximum(max_val, curr_max)
+        sum_exp = sum_exp * tl.exp(max_val - new_max) + tl.sum(tl.exp(z - new_max), axis=0)
+        max_val = new_max
+    
+    lse = max_val + tl.log(sum_exp)
+    tl.store(lse_ptr + row_idx, lse)
+    
+    total_loss = 0.0
+    for k in range(n_predict):
+        target_idx = row_idx + k
+        if target_idx < n_rows:
+            weight = tl.load(mtp_weights_ptr + k)
+            if weight > 0:
+                target = tl.load(targets_ptr + target_idx).to(tl.int32)
+                if target >= 0 and target < n_cols:
+                    val_target = tl.load(logits_row_ptr + target).to(tl.float32)
+                    z_target = A * tl.sigmoid((val_target + B) / C)
+                    total_loss += weight * (lse - z_target)
+    
+    tl.store(losses_ptr + row_idx, total_loss)
+
+@triton.jit
 def fused_mtp_loss_kernel(logits_ptr,
                           output_ptr,
                           batch,
@@ -55,8 +98,45 @@ def fused_mtp_loss_kernel(logits_ptr,
     output_offsets = tl.arange(0, BLOCK_BATCH) + batch_offset
     tl.store(output_ptr + output_offsets, m + tl.log(sumexp))
 
+def fused_softcap(logits, targets, mtp_weights, A=23.0, B=5.0, C=7.5):
+    n_rows, n_cols = logits.shape
+    if mtp_weights is None:
+         mtp_weights = torch.tensor([1.0], device=logits.device, dtype=torch.float32)
+    n_predict = mtp_weights.shape[0]
+
+    losses = torch.empty(n_rows, dtype=torch.float32, device=logits.device)
+    lse = torch.empty(n_rows, dtype=torch.float32, device=logits.device)
+    
+    logits = logits.contiguous()
+    targets = targets.contiguous()
+    mtp_weights = mtp_weights.contiguous()
+
+    BLOCK_BATCH = 4
+
+    #grid = (triton.cdiv(batch,BLOCK_BATCH),)
+    grid = (n_rows,)
+
+    fused_softcapped_entropy_fwd_kernel[grid](
+        logits, losses, lse, targets, mtp_weights,
+        logits.stride(0), logits.stride(1),
+        n_rows, n_cols, n_predict,
+        A, B, C,
+        BLOCK_SIZE=1024,
+        BLOCK_BATCH=4,
+        num_warps=2,
+    )
+    
+    #ctx.save_for_backward(logits, targets, mtp_weights, lse)
+    #ctx.params = (A, B, C)
+    return losses
+
 @torch.compile
 def mtp_loss(logits, target_seq, n_predict, mtp_weights):
+
+    logits = logits.view(-1, logits.size(-1))
+    losses = fused_softcap(logits, target_seq, mtp_weights)
+    return losses.sum()
+
     BLOCK_BATCH = 64
     BLOCK_DIM = 64
 
@@ -67,12 +147,12 @@ def mtp_loss(logits, target_seq, n_predict, mtp_weights):
 
     output = torch.empty((batch,), dtype=torch.float32, device=logits.device)
 
-    grid = (triton.cdiv(batch,BLOCK_BATCH),)
+    #grid = (triton.cdiv(batch,BLOCK_BATCH),)
 
-    fused_mtp_loss_kernel[grid](logits, output, batch, dim, BLOCK_BATCH, BLOCK_DIM)
+    #fused_mtp_loss_kernel[grid](logits, output, batch, dim, BLOCK_BATCH, BLOCK_DIM)
 
     idx = F.pad(target_seq, (0, n_predict - 1)).unfold(0, n_predict, 1)
-    target_logits = 23 * torch.sigmoid((logits.gather(1, idx) + 5) / 7.5)
+    #target_logits = 23 * torch.sigmoid((logits.gather(1, idx) + 5) / 7.5)
     cross_entropy = output.unsqueeze(1) - target_logits
     for k in range(1, n_predict):
         cross_entropy[-k:, k] = 0
