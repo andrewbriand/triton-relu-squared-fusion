@@ -23,7 +23,6 @@ def fused_softcapped_entropy_fwd_kernel(
     n_rows, n_cols, n_predict,
     A, B, C,
     BLOCK_SIZE: tl.constexpr,
-    BLOCK_BATCH: tl.constexpr,
 ):
     row_idx = tl.program_id(0).to(tl.int64)
     logits_row_ptr = logits_ptr + row_idx * stride_logits_n
@@ -111,9 +110,6 @@ def fused_softcap(logits, targets, mtp_weights, A=23.0, B=5.0, C=7.5):
     targets = targets.contiguous()
     mtp_weights = mtp_weights.contiguous()
 
-    BLOCK_BATCH = 4
-
-    #grid = (triton.cdiv(batch,BLOCK_BATCH),)
     grid = (n_rows,)
 
     fused_softcapped_entropy_fwd_kernel[grid](
@@ -122,7 +118,6 @@ def fused_softcap(logits, targets, mtp_weights, A=23.0, B=5.0, C=7.5):
         n_rows, n_cols, n_predict,
         A, B, C,
         BLOCK_SIZE=1024,
-        BLOCK_BATCH=4,
         num_warps=2,
     )
     
