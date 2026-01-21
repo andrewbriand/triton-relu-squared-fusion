@@ -25,39 +25,53 @@ def fused_softcapped_entropy_fwd_kernel(
     BLOCK_SIZE: tl.constexpr,
     BLOCK_BATCH: tl.constexpr,
 ):
-    row_idx = tl.program_id(0).to(tl.int64)
-    logits_row_ptr = logits_ptr + row_idx * stride_logits_n
-    
-    max_val = -float('inf')
-    sum_exp = 0.0
+    #row_idx = tl.program_id(0).to(tl.int64)
+    batch_offset = tl.program_id(0).to(tl.int64) * BLOCK_BATCH
+    batch_offsets = tl.arange(0, BLOCK_BATCH) + batch_offset
+    batch_mask = batch_offsets < n_rows
+
+    max_val = tl.full([BLOCK_BATCH], float("-inf"), tl.float32)
+    sum_exp = tl.zeros([BLOCK_BATCH], tl.float32)
     
     for off in range(0, n_cols, BLOCK_SIZE):
-        cols = off + tl.arange(0, BLOCK_SIZE)
-        mask = cols < n_cols
-        val = tl.load(logits_row_ptr + cols, mask=mask, other=-float('inf')).to(tl.float32)
+        dim_offsets = tl.arange(0, BLOCK_SIZE) + off
+        dim_mask = dim_offsets < n_cols
+
+        logit_offsets = batch_offsets[:, None] * stride_logits_n  + dim_offsets[None, :]
+        logit_mask = batch_mask[:, None] & dim_mask[None, :]
+        val = tl.load(logits_ptr + logit_offsets, logit_mask)
+
         z = A * tl.sigmoid((val + B) / C)
-        z = tl.where(mask, z, -float('inf'))
-        curr_max = tl.max(z, axis=0)
+
+        z = tl.where(logit_mask, z, -float('inf'))
+
+        curr_max = tl.max(z, axis=-1)
+
         new_max = tl.maximum(max_val, curr_max)
-        sum_exp = sum_exp * tl.exp(max_val - new_max) + tl.sum(tl.exp(z - new_max), axis=0)
+
+        tmp = z - new_max[:, None]
+        sum_exp = sum_exp * tl.exp(max_val - new_max) + tl.sum(tl.exp(tmp), axis=-1)
+
         max_val = new_max
     
     lse = max_val + tl.log(sum_exp)
-    tl.store(lse_ptr + row_idx, lse)
+
+    output_offsets = tl.arange(0, BLOCK_BATCH) + batch_offset
+    tl.store(lse_ptr + output_offsets, lse)
     
-    total_loss = 0.0
+    total_loss = tl.zeros([BLOCK_BATCH], tl.float32)
+    row_indices = tl.arange(0, BLOCK_BATCH) + batch_offset
     for k in range(n_predict):
-        target_idx = row_idx + k
-        if target_idx < n_rows:
-            weight = tl.load(mtp_weights_ptr + k)
-            if weight > 0:
-                target = tl.load(targets_ptr + target_idx).to(tl.int32)
-                if target >= 0 and target < n_cols:
-                    val_target = tl.load(logits_row_ptr + target).to(tl.float32)
-                    z_target = A * tl.sigmoid((val_target + B) / C)
-                    total_loss += weight * (lse - z_target)
-    
-    tl.store(losses_ptr + row_idx, total_loss)
+        target_indices = row_indices + k
+        weight = tl.load(mtp_weights_ptr + k)
+        if weight > 0:
+            target = tl.load(targets_ptr + target_indices).to(tl.int32)
+            target_mask = (target >= 0) & (target < n_cols) & (target_indices < n_rows)
+            val_target = tl.load(logits_ptr + target, target_mask, 0.0).to(tl.float32)
+            z_target = A * tl.sigmoid((val_target + B) / C)
+            total_loss += weight * (lse - z_target)
+
+    tl.store(losses_ptr + row_indices, total_loss)
 
 @triton.jit
 def fused_mtp_loss_kernel(logits_ptr,
@@ -111,18 +125,19 @@ def fused_softcap(logits, targets, mtp_weights, A=23.0, B=5.0, C=7.5):
     targets = targets.contiguous()
     mtp_weights = mtp_weights.contiguous()
 
-    BLOCK_BATCH = 4
+    BLOCK_BATCH = 1
+    BLOCK_SIZE = 1024
 
-    #grid = (triton.cdiv(batch,BLOCK_BATCH),)
-    grid = (n_rows,)
+    grid = (triton.cdiv(batch,BLOCK_BATCH),)
+    #grid = (n_rows,)
 
     fused_softcapped_entropy_fwd_kernel[grid](
         logits, losses, lse, targets, mtp_weights,
         logits.stride(0), logits.stride(1),
         n_rows, n_cols, n_predict,
         A, B, C,
-        BLOCK_SIZE=1024,
-        BLOCK_BATCH=4,
+        BLOCK_SIZE=BLOCK_SIZE,
+        BLOCK_BATCH=BLOCK_BATCH,
         num_warps=2,
     )
     
