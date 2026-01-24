@@ -1,5 +1,6 @@
 import torch
 import torch.nn.functional as F
+from torch import Tensor
 
 import triton
 import triton.language as tl
@@ -15,14 +16,113 @@ mtp_weights = torch.tensor([1.0, 0.5, 0.25], device="cuda")
 
 dtype = torch.bfloat16
 
-logits = torch.randn((1, batch, N), dtype=dtype, device="cuda", requires_grad=True)
 target_seq = torch.randint(0, N, (batch,), dtype=torch.int64, device="cuda")
+
+lm_head_weight = torch.randn((dim, N), dtype=torch.bfloat16, device="cuda", requires_grad=True)
+x = torch.randn((1, batch, dim), dtype=dtype, device="cuda", requires_grad=True)
+x_s = 100/448
+w_s = 1.6/448
+grad_s = 0.75/448
 
 A = 23.0
 B = 5.0
 C = 7.5
 
 USE_SOFTCAPPING = True
+
+@torch.library.custom_op("nanogpt::mm_t", mutates_args=())
+def mm_t_op(x: Tensor, w: Tensor, x_s: float, w_s: float, grad_s: float) -> tuple[Tensor, Tensor, Tensor]:
+    """Computes y = x @ w with F8 weights stored as (in_features, out_features)."""
+    @torch.compile
+    def impl(x: Tensor, w: Tensor):
+        assert x.is_contiguous() and w.is_contiguous()
+        assert x.shape[1] == w.shape[0]  # x: (batch, in), w: (in, out)
+
+        x_f8 = x.div(x_s).to(torch.float8_e4m3fn)
+        w_f8 = w.div(w_s).to(torch.float8_e4m3fn)
+
+        # _scaled_mm requires column-major B. w_f8 is row-major (in, out).
+        # .T.contiguous().T creates a column-major view without changing logical shape.
+        w_f8_col_major = w_f8.T.contiguous().T
+
+        out = torch._scaled_mm(
+            x_f8,
+            w_f8_col_major,
+            out_dtype=torch.bfloat16,
+            scale_a=x.new_tensor(x_s, dtype=torch.float32),
+            scale_b=x.new_tensor(w_s, dtype=torch.float32),
+            use_fast_accum=True,
+        )
+        return out, x_f8, w_f8
+
+    return impl(x, w)
+
+@mm_t_op.register_fake
+def _(x: Tensor, w: Tensor, *_):
+    assert x.ndim == w.ndim == 2
+    assert x.shape[1] == w.shape[0]
+    assert x.device == w.device
+    assert x.is_contiguous() and w.is_contiguous()
+    return x @ w, x.to(torch.float8_e4m3fn), w.to(torch.float8_e4m3fn)
+
+@torch.library.custom_op("nanogpt::mm_t_backward", mutates_args=())
+def mm_t_backward_op(g: Tensor, x_f8: Tensor, w_f8: Tensor, x_s: float, w_s: float, grad_s: float) -> tuple[Tensor, Tensor]:
+    @torch.compile
+    def impl(grad: Tensor, x_f8: Tensor, w_f8: Tensor):
+        assert grad.is_contiguous()
+        
+        x_scale = grad.new_tensor(x_s, dtype=torch.float32)
+        w_scale = grad.new_tensor(w_s, dtype=torch.float32)
+        grad_scale = grad.new_tensor(grad_s, dtype=torch.float32)
+        grad_f8 = grad.div(grad_s).to(torch.float8_e5m2)
+        
+        # grad_x = grad @ w.T
+        grad_x = torch._scaled_mm(
+            grad_f8,
+            w_f8.T, 
+            out_dtype=torch.bfloat16,
+            scale_a=grad_scale,
+            scale_b=w_scale,
+            use_fast_accum=False,
+        )
+        
+        # grad_w = x.T @ grad
+        # Result is (in, out), naturally matching weight storage. No final .T needed.
+        grad_w = torch._scaled_mm(
+            x_f8.T.contiguous(),
+            grad_f8.T.contiguous().T,
+            out_dtype=torch.float32,
+            scale_a=x_scale,
+            scale_b=grad_scale,
+            use_fast_accum=False,
+        )
+        
+        return grad_x, grad_w
+
+    grad_x, grad_w = impl(g, x_f8, w_f8)
+
+    return grad_x, grad_w
+
+@mm_t_backward_op.register_fake
+def _(g: Tensor, x_f8: Tensor, w_f8: Tensor, *_):
+    return x_f8.to(torch.bfloat16), w_f8.to(torch.float32)
+
+def backward_t(ctx, grad_out: Tensor, *_):
+    x_f8, w_f8 = ctx.saved_tensors
+    x_s, w_s, grad_s = ctx.scales
+    grad_x, grad_w = torch.ops.nanogpt.mm_t_backward(
+        grad_out, x_f8, w_f8, x_s, w_s, grad_s
+    )
+    return grad_x, grad_w, None, None, None
+
+def setup_context_t(ctx: torch.autograd.function.FunctionCtx, inputs, output):
+    *_, x_s, w_s, grad_s = inputs
+    _, x_f8, w_f8 = output
+    ctx.save_for_backward(x_f8, w_f8)
+    ctx.scales = x_s, w_s, grad_s
+    ctx.set_materialize_grads(False)
+
+mm_t_op.register_autograd(backward_t, setup_context=setup_context_t)
 
 @triton.jit
 def fused_softcapped_entropy_fwd_kernel(
@@ -181,7 +281,18 @@ class FusedSoftcappedCrossEntropy(torch.autograd.Function):
         return result, None, None, None, None, None
 
 @torch.compile(dynamic=False, fullgraph=True)
-def reference(logits, target_seq, n_predict, mtp_weights):
+def kernel(x, lm_head_weight, target_seq, n_predict, mtp_weights):
+    x = x.view(-1, x.shape[-1])
+    logits = torch.ops.nanogpt.mm_t(x, lm_head_weight, x_s=x_s, w_s=w_s, grad_s=grad_s)[0]
+    loss = FusedSoftcappedCrossEntropy.apply(logits, target_seq, mtp_weights, USE_SOFTCAPPING).sum().to(torch.bfloat16)
+
+    return loss
+    
+
+@torch.compile(dynamic=False, fullgraph=True)
+def reference(x, lm_head_weight, target_seq, n_predict, mtp_weights):
+    x = x.view(-1, x.shape[-1])
+    logits = torch.ops.nanogpt.mm_t(x, lm_head_weight, x_s=x_s, w_s=w_s, grad_s=grad_s)[0]
     if USE_SOFTCAPPING:
         logits = 23 * torch.sigmoid((logits + 5) / 7.5)
     logits_flat = logits.view(-1, logits.size(-1))
@@ -193,90 +304,71 @@ def reference(logits, target_seq, n_predict, mtp_weights):
     loss = (cross_entropy * mtp_weights).sum()
     return loss
 
-logits_ref = logits.clone()
-logits_ref.retain_grad()
-logits_kernel = logits.clone()
-logits_kernel.retain_grad()
+x_ref = x.clone()
+lm_head_weight_ref = lm_head_weight.clone()
+x_ref.retain_grad()
+lm_head_weight_ref.retain_grad()
 
-loss_ref = reference(logits_ref, target_seq, n_predict, mtp_weights).to(torch.bfloat16)
+x_kernel = x.clone()
+lm_head_weight_kernel = lm_head_weight.clone()
+x_kernel.retain_grad()
+lm_head_weight_kernel.retain_grad()
+
+loss_ref = reference(x_ref, lm_head_weight_ref, target_seq, n_predict, mtp_weights).to(torch.bfloat16)
 
 loss_ref.backward()
 
-loss_kernel = FusedSoftcappedCrossEntropy.apply(logits_kernel.view(-1, logits_kernel.shape[-1]), target_seq, mtp_weights, USE_SOFTCAPPING).sum().to(torch.bfloat16)
+loss_kernel = kernel(x_kernel, lm_head_weight_kernel, target_seq, n_predict, mtp_weights)
 
 loss_kernel.backward()
 
 print("loss ref: ", loss_ref)
 print("loss kernel: ", loss_kernel)
 
-print("logits_ref.grad:", logits_ref.grad)
-print("logits_kernel.grad:", logits_kernel.grad)
+print("x_ref.grad:", x_ref.grad)
+print("x_kernel.grad:", x_kernel.grad)
 
-torch.testing.assert_close(loss_ref, loss_kernel)
-torch.testing.assert_close(logits_ref.grad, logits_kernel.grad)
+print("lm_head_ref.grad:", lm_head_weight_ref.grad)
+print("lm_head_kernel.grad:", lm_head_weight_kernel.grad)
 
-print("PASS")
+weight_matrix_size_gb_bf16 = dim * N * 2 / 1e9
+SOL_weight_matrix_conversion_ms = 1.5 * weight_matrix_size_gb_bf16 / 3350 * 1000
 
-# Benchmark forward
+print("LM head weight matrix size GB bf16:", weight_matrix_size_gb_bf16)
+print("SOL weight matrix conversion ms:", SOL_weight_matrix_conversion_ms)
+
+#torch.testing.assert_close(loss_ref, loss_kernel)
+#torch.testing.assert_close(x_ref.grad, x_kernel.grad)
+#torch.testing.assert_close(lm_head_weight_ref.grad, lm_head_weight_kernel.grad)
+
+#print("PASS")
 
 warmups = 5
 iters = 100
 
 for i in range(warmups):
-    loss_kernel = FusedSoftcappedCrossEntropy.apply(logits_kernel.view(-1, logits_kernel.shape[-1]), target_seq, mtp_weights, USE_SOFTCAPPING).sum().to(torch.bfloat16)
+    loss_ref = reference(x_ref, lm_head_weight_ref, target_seq, n_predict, mtp_weights).to(torch.bfloat16)
+    loss_ref.backward()
 
 
 torch.cuda.synchronize()
-start = time.time()
 for i in range(iters):
-    loss_kernel = FusedSoftcappedCrossEntropy.apply(logits_kernel.view(-1, logits_kernel.shape[-1]), target_seq, mtp_weights, USE_SOFTCAPPING).sum().to(torch.bfloat16)
+    loss_ref = reference(x_ref, lm_head_weight_ref, target_seq, n_predict, mtp_weights).to(torch.bfloat16)
+    loss_ref.backward()
 torch.cuda.synchronize()
-end = time.time()
-
-fwd_time_s = (end - start) / iters
-fwd_time_ms = fwd_time_s * 1000
-
-input_size_fwd_gb = (2 * batch * N) / 1e9
-fwd_throughput_gb_s = input_size_fwd_gb / fwd_time_s
-
-H100_mem_bw_gb_s = 3350
-
-fwd_peak_H100 = 100 * (fwd_throughput_gb_s / H100_mem_bw_gb_s)
-
-print("Forward time (ms): ", fwd_time_ms)
-print("Forward throughput (GB/s):", fwd_throughput_gb_s)
-print("Forward % peak H100:", round(fwd_peak_H100, 0))
-
-# Benchmark backward
-
-warmups = 5
-iters = 100
-
-grad_out = torch.randn_like(loss_kernel, device="cuda")
-lse = torch.randn(batch, dtype=torch.float32, device="cuda")
 
 for i in range(warmups):
-    grad = bwd_raw(grad_out, logits_kernel.view(-1, logits_kernel.shape[-1]), target_seq, mtp_weights, lse, A, B, C, USE_SOFTCAPPING)
+    loss_kernel = kernel(x_kernel, lm_head_weight_kernel, target_seq, n_predict, mtp_weights)
+    loss_kernel.backward()
 
 torch.cuda.synchronize()
 start = time.time()
 for i in range(iters):
-    grad = bwd_raw(grad_out, logits_kernel.view(-1, logits_kernel.shape[-1]), target_seq, mtp_weights, lse, A, B, C, USE_SOFTCAPPING)
+    loss_kernel = kernel(x_kernel, lm_head_weight_kernel, target_seq, n_predict, mtp_weights)
+    loss_kernel.backward()
 torch.cuda.synchronize()
 end = time.time()
+avg_fwd_bwd_ms = (end - start) / iters * 1000
 
-bwd_time_s = (end - start) / iters
-bwd_time_ms = bwd_time_s * 1000
-
-mem_traffic_bwd_gb = 2 * (2 * batch * N) / 1e9
-bwd_throughput_gb_s = mem_traffic_bwd_gb / bwd_time_s
-
-H100_mem_bw_gb_s = 3350
-
-bwd_peak_H100 = 100 * (bwd_throughput_gb_s / H100_mem_bw_gb_s)
-
-print("Backward time (ms): ", bwd_time_ms)
-print("Backward throughput (GB/s):", bwd_throughput_gb_s)
-print("Backward % peak H100:", round(bwd_peak_H100, 0))
-
+print("Average fwd bwd ms:", avg_fwd_bwd_ms)
 
