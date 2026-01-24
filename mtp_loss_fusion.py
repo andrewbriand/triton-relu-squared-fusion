@@ -74,7 +74,11 @@ def mm_t_backward_op(g: Tensor, x_f8: Tensor, w_f8: Tensor, x_s: float, w_s: flo
         x_scale = grad.new_tensor(x_s, dtype=torch.float32)
         w_scale = grad.new_tensor(w_s, dtype=torch.float32)
         grad_scale = grad.new_tensor(grad_s, dtype=torch.float32)
-        grad_f8 = grad.div(grad_s).to(torch.float8_e5m2)
+
+        if grad.dtype != torch.float8_e5m2:
+            grad_f8 = grad.div(grad_s).to(torch.float8_e5m2)
+        else:
+            grad_f8 = grad
         
         # grad_x = grad @ w.T
         grad_x = torch._scaled_mm(
@@ -223,26 +227,6 @@ def fused_softcapped_entropy_bwd_kernel(
         grad_x = grad_z * dz_dx
         tl.store(grad_row_ptr + cols, grad_x.to(tl.bfloat16), mask=mask)
 
-def bwd_raw(grad_output, logits, targets, mtp_weights, lse, A, B, C, USE_SOFTCAPPING):
-    n_rows, n_cols = logits.shape
-    n_predict = mtp_weights.shape[0]
-
-    grad_input = torch.empty((n_rows, n_cols), dtype=torch.bfloat16, device=logits.device)
-    grad_output = grad_output.contiguous()
-
-    grid = (n_rows,)
-    fused_softcapped_entropy_bwd_kernel[grid](
-        grad_input, grad_output, lse, logits, targets, mtp_weights,
-        logits.stride(0), logits.stride(1), grad_input.stride(0), grad_input.stride(1),
-        n_rows, n_cols, n_predict,
-        A, B, C,
-        BLOCK_SIZE=1024,
-        USE_SOFTCAPPING=USE_SOFTCAPPING,
-        num_warps=2
-    )
-
-    return grad_input
-
 class FusedSoftcappedCrossEntropy(torch.autograd.Function):
     @staticmethod
     def forward(ctx, logits, targets, mtp_weights, USE_SOFTCAPPING, A=23.0, B=5.0, C=7.5):
@@ -277,17 +261,31 @@ class FusedSoftcappedCrossEntropy(torch.autograd.Function):
     def backward(ctx, grad_output):
         logits, targets, mtp_weights, lse = ctx.saved_tensors
         A, B, C, USE_SOFTCAPPING = ctx.params
-        result = bwd_raw(grad_output, logits, targets, mtp_weights, lse, A, B, C, USE_SOFTCAPPING)
-        return result, None, None, None, None, None
+        n_rows, n_cols = logits.shape
+        n_predict = mtp_weights.shape[0]
+
+        grad_input = torch.empty((n_rows, n_cols), dtype=torch.bfloat16, device=logits.device)
+        grad_output = grad_output.contiguous()
+
+        grid = (n_rows,)
+        fused_softcapped_entropy_bwd_kernel[grid](
+            grad_input, grad_output, lse, logits, targets, mtp_weights,
+            logits.stride(0), logits.stride(1), grad_input.stride(0), grad_input.stride(1),
+            n_rows, n_cols, n_predict,
+            A, B, C,
+            BLOCK_SIZE=1024,
+            USE_SOFTCAPPING=USE_SOFTCAPPING,
+            num_warps=2
+        )
+
+        return grad_input, None, None, None, None, None
 
 @torch.compile(dynamic=False, fullgraph=True)
 def kernel(x, lm_head_weight, target_seq, n_predict, mtp_weights):
     x = x.view(-1, x.shape[-1])
     logits = torch.ops.nanogpt.mm_t(x, lm_head_weight, x_s=x_s, w_s=w_s, grad_s=grad_s)[0]
     loss = FusedSoftcappedCrossEntropy.apply(logits, target_seq, mtp_weights, USE_SOFTCAPPING).sum().to(torch.bfloat16)
-
     return loss
-    
 
 @torch.compile(dynamic=False, fullgraph=True)
 def reference(x, lm_head_weight, target_seq, n_predict, mtp_weights):
