@@ -28,7 +28,7 @@ A = 23.0
 B = 5.0
 C = 7.5
 
-USE_SOFTCAPPING = True
+USE_SOFTCAPPING = False
 
 @torch.library.custom_op("nanogpt::mm_t", mutates_args=())
 def mm_t_op(x: Tensor, w: Tensor, x_s: float, w_s: float, grad_s: float) -> tuple[Tensor, Tensor, Tensor]:
@@ -93,7 +93,6 @@ def mm_t_backward_op(g: Tensor, x_f8: Tensor, w_f8: Tensor, x_s: float, w_s: flo
         
         # grad_w = x.T @ grad
         # Result is (in, out), naturally matching weight storage. No final .T needed.
-        #print(f"{grad_f8=}")
         grad_w = torch._scaled_mm(
             x_f8.T.contiguous(),
             grad_f8.T.contiguous().T,
@@ -299,9 +298,6 @@ class FusedSoftcappedCrossEntropy(torch.autograd.Function):
             num_warps=2
         )
 
-        #print(f"{grad_input=}")
-        #grad_f8 = grad_input.div(grad_s).to(torch.float8_e5m2)
-
         x_scale = grad_input.new_tensor(x_s, dtype=torch.float32)
         w_scale = grad_input.new_tensor(w_s, dtype=torch.float32)
         grad_scale = grad_input.new_tensor(grad_s, dtype=torch.float32)
@@ -315,20 +311,9 @@ class FusedSoftcappedCrossEntropy(torch.autograd.Function):
             use_fast_accum=False,
         )
 
-        #print(f"{grad_f8=}")
-
-        a = x_f8.T.contiguous()
-        b = grad_input.T.contiguous().T
-
-        # The rows of A are contiguous in memory.
-        # i.e. a.stride(1) == 1
-
-        # The columns of B are contiguous in memory
-        # i.e. b.stride(0) == 1
-
         grad_w = torch._scaled_mm(
-            a,
-            b,#.contiguous().T,
+            x_f8.T.contiguous(),
+            grad_input.T.contiguous().T,
             out_dtype=torch.float32,
             scale_a=x_scale,
             scale_b=grad_scale,
@@ -340,7 +325,6 @@ class FusedSoftcappedCrossEntropy(torch.autograd.Function):
 @torch.compile()
 def kernel(x, lm_head_weight, target_seq, n_predict, mtp_weights):
     x = x.view(-1, x.shape[-1])
-    #logits = torch.ops.nanogpt.mm_t(x, lm_head_weight, x_s=x_s, w_s=w_s, grad_s=grad_s)[0]
     loss = FusedSoftcappedCrossEntropy.apply(x, target_seq, mtp_weights, USE_SOFTCAPPING, lm_head_weight, x_s, w_s, grad_s).sum().to(torch.bfloat16)
     return loss
 
@@ -348,7 +332,6 @@ def kernel(x, lm_head_weight, target_seq, n_predict, mtp_weights):
 def reference(x, lm_head_weight, target_seq, n_predict, mtp_weights):
     x = x.view(-1, x.shape[-1])
     logits = torch.ops.nanogpt.mm_t(x, lm_head_weight, x_s=x_s, w_s=w_s, grad_s=grad_s)[0]
-    #print(f"{logits=}")
     if USE_SOFTCAPPING:
         logits = 23 * torch.sigmoid((logits + 5) / 7.5)
     logits_flat = logits.view(-1, logits.size(-1))
@@ -393,11 +376,14 @@ SOL_weight_matrix_conversion_ms = 1.5 * weight_matrix_size_gb_bf16 / 3350 * 1000
 print("LM head weight matrix size GB bf16:", weight_matrix_size_gb_bf16)
 print("SOL weight matrix conversion ms:", SOL_weight_matrix_conversion_ms)
 
-#torch.testing.assert_close(loss_ref, loss_kernel)
-#torch.testing.assert_close(x_ref.grad, x_kernel.grad)
-#torch.testing.assert_close(lm_head_weight_ref.grad, lm_head_weight_kernel.grad)
+atol = 1
+rtol = 10e-2
 
-#print("PASS")
+torch.testing.assert_close(loss_ref, loss_kernel, atol=atol, rtol=rtol)
+torch.testing.assert_close(x_ref.grad, x_kernel.grad, atol=atol, rtol=rtol)
+torch.testing.assert_close(lm_head_weight_ref.grad, lm_head_weight_kernel.grad, atol=atol, rtol=rtol)
+
+print("PASS")
 
 warmups = 5
 iters = 100
