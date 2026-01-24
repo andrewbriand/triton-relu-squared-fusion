@@ -75,6 +75,7 @@ def mm_t_backward_op(g: Tensor, x_f8: Tensor, w_f8: Tensor, x_s: float, w_s: flo
         w_scale = grad.new_tensor(w_s, dtype=torch.float32)
         grad_scale = grad.new_tensor(grad_s, dtype=torch.float32)
 
+        #print(f"{grad=}")
         if grad.dtype != torch.float8_e5m2:
             grad_f8 = grad.div(grad_s).to(torch.float8_e5m2)
         else:
@@ -92,6 +93,7 @@ def mm_t_backward_op(g: Tensor, x_f8: Tensor, w_f8: Tensor, x_s: float, w_s: flo
         
         # grad_w = x.T @ grad
         # Result is (in, out), naturally matching weight storage. No final .T needed.
+        #print(f"{grad_f8=}")
         grad_w = torch._scaled_mm(
             x_f8.T.contiguous(),
             grad_f8.T.contiguous().T,
@@ -229,7 +231,22 @@ def fused_softcapped_entropy_bwd_kernel(
 
 class FusedSoftcappedCrossEntropy(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, logits, targets, mtp_weights, USE_SOFTCAPPING, A=23.0, B=5.0, C=7.5):
+    def forward(ctx, x, targets, mtp_weights, USE_SOFTCAPPING, lm_head_weight, x_s, w_s, grad_s, A=23.0, B=5.0, C=7.5):
+
+        x_f8 = x.div(x_s).to(torch.float8_e4m3fn)
+        w_f8 = lm_head_weight.div(w_s).to(torch.float8_e4m3fn)
+ 
+        w_f8_col_major = w_f8.T.contiguous().T
+
+        logits = torch._scaled_mm(
+            x_f8,
+            w_f8_col_major,
+            out_dtype=torch.bfloat16,
+            scale_a=x.new_tensor(x_s, dtype=torch.float32),
+            scale_b=x.new_tensor(w_s, dtype=torch.float32),
+            use_fast_accum=True,
+        )
+
         n_rows, n_cols = logits.shape
         if mtp_weights is None:
              mtp_weights = torch.tensor([1.0], device=logits.device, dtype=torch.float32)
@@ -252,15 +269,17 @@ class FusedSoftcappedCrossEntropy(torch.autograd.Function):
             USE_SOFTCAPPING=USE_SOFTCAPPING,
             num_warps=2
         )
+
+        #print(f"{logits=}")
         
-        ctx.save_for_backward(logits, targets, mtp_weights, lse)
-        ctx.params = (A, B, C, USE_SOFTCAPPING)
+        ctx.save_for_backward(logits, targets, mtp_weights, lse, x, lm_head_weight, x_f8, w_f8)
+        ctx.params = (A, B, C, USE_SOFTCAPPING, x_s, w_s, grad_s)
         return losses
 
     @staticmethod
     def backward(ctx, grad_output):
-        logits, targets, mtp_weights, lse = ctx.saved_tensors
-        A, B, C, USE_SOFTCAPPING = ctx.params
+        logits, targets, mtp_weights, lse, x, lm_head_weight, x_f8, w_f8 = ctx.saved_tensors
+        A, B, C, USE_SOFTCAPPING, x_s, w_s, grad_s = ctx.params
         n_rows, n_cols = logits.shape
         n_predict = mtp_weights.shape[0]
 
@@ -278,19 +297,46 @@ class FusedSoftcappedCrossEntropy(torch.autograd.Function):
             num_warps=2
         )
 
-        return grad_input, None, None, None, None, None
+        #print(f"{grad_input=}")
+        grad_f8 = grad_input.div(grad_s).to(torch.float8_e5m2)
 
-@torch.compile(dynamic=False, fullgraph=True)
+        x_scale = grad_input.new_tensor(x_s, dtype=torch.float32)
+        w_scale = grad_input.new_tensor(w_s, dtype=torch.float32)
+        grad_scale = grad_input.new_tensor(grad_s, dtype=torch.float32)
+
+        grad_x = torch._scaled_mm(
+            grad_f8,
+            w_f8.T, 
+            out_dtype=torch.bfloat16,
+            scale_a=grad_scale,
+            scale_b=w_scale,
+            use_fast_accum=False,
+        )
+
+        #print(f"{grad_f8=}")
+        grad_w = torch._scaled_mm(
+            x_f8.T.contiguous(),
+            grad_f8.T.contiguous().T,
+            out_dtype=torch.float32,
+            scale_a=x_scale,
+            scale_b=grad_scale,
+            use_fast_accum=False,
+        )
+        
+        return grad_x, None, None, None, grad_w, None, None, None
+
+@torch.compile()
 def kernel(x, lm_head_weight, target_seq, n_predict, mtp_weights):
     x = x.view(-1, x.shape[-1])
-    logits = torch.ops.nanogpt.mm_t(x, lm_head_weight, x_s=x_s, w_s=w_s, grad_s=grad_s)[0]
-    loss = FusedSoftcappedCrossEntropy.apply(logits, target_seq, mtp_weights, USE_SOFTCAPPING).sum().to(torch.bfloat16)
+    #logits = torch.ops.nanogpt.mm_t(x, lm_head_weight, x_s=x_s, w_s=w_s, grad_s=grad_s)[0]
+    loss = FusedSoftcappedCrossEntropy.apply(x, target_seq, mtp_weights, USE_SOFTCAPPING, lm_head_weight, x_s, w_s, grad_s).sum().to(torch.bfloat16)
     return loss
 
-@torch.compile(dynamic=False, fullgraph=True)
+@torch.compile()
 def reference(x, lm_head_weight, target_seq, n_predict, mtp_weights):
     x = x.view(-1, x.shape[-1])
     logits = torch.ops.nanogpt.mm_t(x, lm_head_weight, x_s=x_s, w_s=w_s, grad_s=grad_s)[0]
+    #print(f"{logits=}")
     if USE_SOFTCAPPING:
         logits = 23 * torch.sigmoid((logits + 5) / 7.5)
     logits_flat = logits.view(-1, logits.size(-1))
@@ -347,7 +393,6 @@ iters = 100
 for i in range(warmups):
     loss_ref = reference(x_ref, lm_head_weight_ref, target_seq, n_predict, mtp_weights).to(torch.bfloat16)
     loss_ref.backward()
-
 
 torch.cuda.synchronize()
 for i in range(iters):
