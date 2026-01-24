@@ -185,6 +185,7 @@ def fused_softcapped_entropy_bwd_kernel(
     stride_logits_n, stride_logits_v, stride_grad_n, stride_grad_v,
     n_rows, n_cols, n_predict,
     A, B, C,
+    grad_s,
     BLOCK_SIZE: tl.constexpr,
     USE_SOFTCAPPING: tl.constexpr
 ):
@@ -227,7 +228,9 @@ def fused_softcapped_entropy_bwd_kernel(
         else:
             dz_dx = 1
         grad_x = grad_z * dz_dx
-        tl.store(grad_row_ptr + cols, grad_x.to(tl.bfloat16), mask=mask)
+        grad_x = grad_x / grad_s
+        grad_x = grad_x.to(tl.float8e5)
+        tl.store(grad_row_ptr + cols, grad_x, mask=mask)
 
 class FusedSoftcappedCrossEntropy(torch.autograd.Function):
     @staticmethod
@@ -270,8 +273,6 @@ class FusedSoftcappedCrossEntropy(torch.autograd.Function):
             num_warps=2
         )
 
-        #print(f"{logits=}")
-        
         ctx.save_for_backward(logits, targets, mtp_weights, lse, x, lm_head_weight, x_f8, w_f8)
         ctx.params = (A, B, C, USE_SOFTCAPPING, x_s, w_s, grad_s)
         return losses
@@ -283,7 +284,7 @@ class FusedSoftcappedCrossEntropy(torch.autograd.Function):
         n_rows, n_cols = logits.shape
         n_predict = mtp_weights.shape[0]
 
-        grad_input = torch.empty((n_rows, n_cols), dtype=torch.bfloat16, device=logits.device)
+        grad_input = torch.empty((n_rows, n_cols), dtype=torch.float8_e5m2, device=logits.device)
         grad_output = grad_output.contiguous()
 
         grid = (n_rows,)
@@ -292,20 +293,21 @@ class FusedSoftcappedCrossEntropy(torch.autograd.Function):
             logits.stride(0), logits.stride(1), grad_input.stride(0), grad_input.stride(1),
             n_rows, n_cols, n_predict,
             A, B, C,
+            grad_s,
             BLOCK_SIZE=1024,
             USE_SOFTCAPPING=USE_SOFTCAPPING,
             num_warps=2
         )
 
         #print(f"{grad_input=}")
-        grad_f8 = grad_input.div(grad_s).to(torch.float8_e5m2)
+        #grad_f8 = grad_input.div(grad_s).to(torch.float8_e5m2)
 
         x_scale = grad_input.new_tensor(x_s, dtype=torch.float32)
         w_scale = grad_input.new_tensor(w_s, dtype=torch.float32)
         grad_scale = grad_input.new_tensor(grad_s, dtype=torch.float32)
 
         grad_x = torch._scaled_mm(
-            grad_f8,
+            grad_input,
             w_f8.T, 
             out_dtype=torch.bfloat16,
             scale_a=grad_scale,
@@ -314,9 +316,19 @@ class FusedSoftcappedCrossEntropy(torch.autograd.Function):
         )
 
         #print(f"{grad_f8=}")
+
+        a = x_f8.T.contiguous()
+        b = grad_input.T.contiguous().T
+
+        # The rows of A are contiguous in memory.
+        # i.e. a.stride(1) == 1
+
+        # The columns of B are contiguous in memory
+        # i.e. b.stride(0) == 1
+
         grad_w = torch._scaled_mm(
-            x_f8.T.contiguous(),
-            grad_f8.T.contiguous().T,
+            a,
+            b,#.contiguous().T,
             out_dtype=torch.float32,
             scale_a=x_scale,
             scale_b=grad_scale,
