@@ -4,6 +4,8 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
+import time
+
 batch = 8 * 2048
 N = 50304
 dim = 768
@@ -16,7 +18,11 @@ dtype = torch.bfloat16
 logits = torch.randn((1, batch, N), dtype=dtype, device="cuda", requires_grad=True)
 target_seq = torch.randint(0, N, (batch,), dtype=torch.int64, device="cuda")
 
-USE_SOFTCAPPING = False
+A = 23.0
+B = 5.0
+C = 7.5
+
+USE_SOFTCAPPING = True
 
 @triton.jit
 def fused_softcapped_entropy_fwd_kernel(
@@ -117,6 +123,26 @@ def fused_softcapped_entropy_bwd_kernel(
         grad_x = grad_z * dz_dx
         tl.store(grad_row_ptr + cols, grad_x.to(tl.bfloat16), mask=mask)
 
+def bwd_raw(grad_output, logits, targets, mtp_weights, lse, A, B, C, USE_SOFTCAPPING):
+    n_rows, n_cols = logits.shape
+    n_predict = mtp_weights.shape[0]
+
+    grad_input = torch.empty((n_rows, n_cols), dtype=torch.bfloat16, device=logits.device)
+    grad_output = grad_output.contiguous()
+
+    grid = (n_rows,)
+    fused_softcapped_entropy_bwd_kernel[grid](
+        grad_input, grad_output, lse, logits, targets, mtp_weights,
+        logits.stride(0), logits.stride(1), grad_input.stride(0), grad_input.stride(1),
+        n_rows, n_cols, n_predict,
+        A, B, C,
+        BLOCK_SIZE=1024,
+        USE_SOFTCAPPING=USE_SOFTCAPPING,
+        num_warps=2
+    )
+
+    return grad_input
+
 class FusedSoftcappedCrossEntropy(torch.autograd.Function):
     @staticmethod
     def forward(ctx, logits, targets, mtp_weights, USE_SOFTCAPPING, A=23.0, B=5.0, C=7.5):
@@ -151,23 +177,8 @@ class FusedSoftcappedCrossEntropy(torch.autograd.Function):
     def backward(ctx, grad_output):
         logits, targets, mtp_weights, lse = ctx.saved_tensors
         A, B, C, USE_SOFTCAPPING = ctx.params
-        n_rows, n_cols = logits.shape
-        n_predict = mtp_weights.shape[0]
-        
-        grad_input = torch.empty((n_rows, n_cols), dtype=torch.bfloat16, device=logits.device)
-        grad_output = grad_output.contiguous()
-        
-        grid = (n_rows,)
-        fused_softcapped_entropy_bwd_kernel[grid](
-            grad_input, grad_output, lse, logits, targets, mtp_weights,
-            logits.stride(0), logits.stride(1), grad_input.stride(0), grad_input.stride(1),
-            n_rows, n_cols, n_predict,
-            A, B, C,
-            BLOCK_SIZE=1024,
-            USE_SOFTCAPPING=USE_SOFTCAPPING,
-            num_warps=2
-        )
-        return grad_input, None, None, None, None, None
+        result = bwd_raw(grad_output, logits, targets, mtp_weights, lse, A, B, C, USE_SOFTCAPPING)
+        return result, None, None, None, None, None
 
 @torch.compile(dynamic=False, fullgraph=True)
 def reference(logits, target_seq, n_predict, mtp_weights):
@@ -205,3 +216,67 @@ torch.testing.assert_close(loss_ref, loss_kernel)
 torch.testing.assert_close(logits_ref.grad, logits_kernel.grad)
 
 print("PASS")
+
+# Benchmark forward
+
+warmups = 5
+iters = 100
+
+for i in range(warmups):
+    loss_kernel = FusedSoftcappedCrossEntropy.apply(logits_kernel.view(-1, logits_kernel.shape[-1]), target_seq, mtp_weights, USE_SOFTCAPPING).sum().to(torch.bfloat16)
+
+
+torch.cuda.synchronize()
+start = time.time()
+for i in range(iters):
+    loss_kernel = FusedSoftcappedCrossEntropy.apply(logits_kernel.view(-1, logits_kernel.shape[-1]), target_seq, mtp_weights, USE_SOFTCAPPING).sum().to(torch.bfloat16)
+torch.cuda.synchronize()
+end = time.time()
+
+fwd_time_s = (end - start) / iters
+fwd_time_ms = fwd_time_s * 1000
+
+input_size_fwd_gb = (2 * batch * N) / 1e9
+fwd_throughput_gb_s = input_size_fwd_gb / fwd_time_s
+
+H100_mem_bw_gb_s = 3350
+
+fwd_peak_H100 = 100 * (fwd_throughput_gb_s / H100_mem_bw_gb_s)
+
+print("Forward time (ms): ", fwd_time_ms)
+print("Forward throughput (GB/s):", fwd_throughput_gb_s)
+print("Forward % peak H100:", round(fwd_peak_H100, 0))
+
+# Benchmark backward
+
+warmups = 5
+iters = 100
+
+grad_out = torch.randn_like(loss_kernel, device="cuda")
+lse = torch.randn(batch, dtype=torch.float32, device="cuda")
+
+for i in range(warmups):
+    grad = bwd_raw(grad_out, logits_kernel.view(-1, logits_kernel.shape[-1]), target_seq, mtp_weights, lse, A, B, C, USE_SOFTCAPPING)
+
+torch.cuda.synchronize()
+start = time.time()
+for i in range(iters):
+    grad = bwd_raw(grad_out, logits_kernel.view(-1, logits_kernel.shape[-1]), target_seq, mtp_weights, lse, A, B, C, USE_SOFTCAPPING)
+torch.cuda.synchronize()
+end = time.time()
+
+bwd_time_s = (end - start) / iters
+bwd_time_ms = bwd_time_s * 1000
+
+mem_traffic_bwd_gb = 2 * (2 * batch * N) / 1e9
+bwd_throughput_gb_s = mem_traffic_bwd_gb / bwd_time_s
+
+H100_mem_bw_gb_s = 3350
+
+bwd_peak_H100 = 100 * (bwd_throughput_gb_s / H100_mem_bw_gb_s)
+
+print("Backward time (ms): ", bwd_time_ms)
+print("Backward throughput (GB/s):", bwd_throughput_gb_s)
+print("Backward % peak H100:", round(bwd_peak_H100, 0))
+
+
