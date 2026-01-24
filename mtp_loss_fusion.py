@@ -376,8 +376,8 @@ SOL_weight_matrix_conversion_ms = 1.5 * weight_matrix_size_gb_bf16 / 3350 * 1000
 print("LM head weight matrix size GB bf16:", weight_matrix_size_gb_bf16)
 print("SOL weight matrix conversion ms:", SOL_weight_matrix_conversion_ms)
 
-atol = 1
-rtol = 10e-2
+atol = 0.75
+rtol = 1e-1
 
 torch.testing.assert_close(loss_ref, loss_kernel, atol=atol, rtol=rtol)
 torch.testing.assert_close(x_ref.grad, x_kernel.grad, atol=atol, rtol=rtol)
