@@ -28,8 +28,6 @@ A = 23.0
 B = 5.0
 C = 7.5
 
-USE_SOFTCAPPING = False
-
 @torch.library.custom_op("nanogpt::mm_t", mutates_args=())
 def mm_t_op(x: Tensor, w: Tensor, x_s: float, w_s: float, grad_s: float) -> tuple[Tensor, Tensor, Tensor]:
     """Computes y = x @ w with F8 weights stored as (in_features, out_features)."""
@@ -135,8 +133,7 @@ def fused_softcapped_entropy_fwd_kernel(
     stride_logits_n, stride_logits_v,
     n_rows, n_cols, n_predict,
     A, B, C,
-    BLOCK_SIZE: tl.constexpr,
-    USE_SOFTCAPPING: tl.constexpr
+    BLOCK_SIZE: tl.constexpr
 ):
     row_idx = tl.program_id(0).to(tl.int64)
     logits_row_ptr = logits_ptr + row_idx * stride_logits_n
@@ -148,10 +145,7 @@ def fused_softcapped_entropy_fwd_kernel(
         cols = off + tl.arange(0, BLOCK_SIZE)
         mask = cols < n_cols
         val = tl.load(logits_row_ptr + cols, mask=mask, other=-float('inf')).to(tl.float32)
-        if USE_SOFTCAPPING:
-            z = A * tl.sigmoid((val + B) / C)
-        else:
-            z = val
+        z = A * tl.sigmoid((val + B) / C)
         z = tl.where(mask, z, -float('inf'))
         curr_max = tl.max(z, axis=0)
         new_max = tl.maximum(max_val, curr_max)
@@ -170,10 +164,7 @@ def fused_softcapped_entropy_fwd_kernel(
                 target = tl.load(targets_ptr + target_idx).to(tl.int32)
                 if target >= 0 and target < n_cols:
                     val_target = tl.load(logits_row_ptr + target).to(tl.float32)
-                    if USE_SOFTCAPPING:
-                        z_target = A * tl.sigmoid((val_target + B) / C)
-                    else:
-                        z_target = val_target
+                    z_target = A * tl.sigmoid((val_target + B) / C)
                     total_loss += weight * (lse - z_target)
     
     tl.store(losses_ptr + row_idx, total_loss)
@@ -185,8 +176,7 @@ def fused_softcapped_entropy_bwd_kernel(
     n_rows, n_cols, n_predict,
     A, B, C,
     grad_s,
-    BLOCK_SIZE: tl.constexpr,
-    USE_SOFTCAPPING: tl.constexpr
+    BLOCK_SIZE: tl.constexpr
 ):
     row_idx = tl.program_id(0).to(tl.int64)
 
@@ -205,12 +195,9 @@ def fused_softcapped_entropy_bwd_kernel(
         cols = off + tl.arange(0, BLOCK_SIZE)
         mask = cols < n_cols
         val = tl.load(logits_row_ptr + cols, mask=mask, other=0.0).to(tl.float32)
-        if USE_SOFTCAPPING:
-            u = (val + B) / C
-            sigmoid_u = tl.sigmoid(u)
-            z = A * sigmoid_u
-        else:
-            z = val
+        u = (val + B) / C
+        sigmoid_u = tl.sigmoid(u)
+        z = A * sigmoid_u
         p = tl.exp(z - lse)
         
         term1 = S_w * p
@@ -222,10 +209,7 @@ def fused_softcapped_entropy_bwd_kernel(
                 term2 += tl.where(cols == target, weight, 0.0)
         
         grad_z = grad_loss * (term1 - term2)
-        if USE_SOFTCAPPING:
-            dz_dx = (1.0 / C) * z * (1.0 - sigmoid_u)
-        else:
-            dz_dx = 1
+        dz_dx = (1.0 / C) * z * (1.0 - sigmoid_u)
         grad_x = grad_z * dz_dx
         grad_x = grad_x / grad_s
         grad_x = grad_x.to(tl.float8e5)
@@ -233,7 +217,7 @@ def fused_softcapped_entropy_bwd_kernel(
 
 class FusedSoftcappedCrossEntropy(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x, targets, mtp_weights, USE_SOFTCAPPING, lm_head_weight, x_s, w_s, grad_s, A=23.0, B=5.0, C=7.5):
+    def forward(ctx, x, targets, mtp_weights, lm_head_weight, x_s, w_s, grad_s, A=23.0, B=5.0, C=7.5):
 
         x_f8 = x.div(x_s).to(torch.float8_e4m3fn)
         w_f8 = lm_head_weight.div(w_s).to(torch.float8_e4m3fn)
@@ -268,18 +252,17 @@ class FusedSoftcappedCrossEntropy(torch.autograd.Function):
             n_rows, n_cols, n_predict,
             A, B, C,
             BLOCK_SIZE=1024,
-            USE_SOFTCAPPING=USE_SOFTCAPPING,
             num_warps=2
         )
 
         ctx.save_for_backward(logits, targets, mtp_weights, lse, x, lm_head_weight, x_f8, w_f8)
-        ctx.params = (A, B, C, USE_SOFTCAPPING, x_s, w_s, grad_s)
+        ctx.params = (A, B, C, x_s, w_s, grad_s)
         return losses
 
     @staticmethod
     def backward(ctx, grad_output):
         logits, targets, mtp_weights, lse, x, lm_head_weight, x_f8, w_f8 = ctx.saved_tensors
-        A, B, C, USE_SOFTCAPPING, x_s, w_s, grad_s = ctx.params
+        A, B, C, x_s, w_s, grad_s = ctx.params
         n_rows, n_cols = logits.shape
         n_predict = mtp_weights.shape[0]
 
@@ -294,7 +277,6 @@ class FusedSoftcappedCrossEntropy(torch.autograd.Function):
             A, B, C,
             grad_s,
             BLOCK_SIZE=1024,
-            USE_SOFTCAPPING=USE_SOFTCAPPING,
             num_warps=2
         )
 
@@ -320,20 +302,19 @@ class FusedSoftcappedCrossEntropy(torch.autograd.Function):
             use_fast_accum=False,
         )
         
-        return grad_x, None, None, None, grad_w, None, None, None
+        return grad_x, None, None, grad_w, None, None, None
 
 @torch.compile()
 def kernel(x, lm_head_weight, target_seq, n_predict, mtp_weights):
     x = x.view(-1, x.shape[-1])
-    loss = FusedSoftcappedCrossEntropy.apply(x, target_seq, mtp_weights, USE_SOFTCAPPING, lm_head_weight, x_s, w_s, grad_s).sum().to(torch.bfloat16)
+    loss = FusedSoftcappedCrossEntropy.apply(x, target_seq, mtp_weights, lm_head_weight, x_s, w_s, grad_s).sum().to(torch.bfloat16)
     return loss
 
 @torch.compile()
 def reference(x, lm_head_weight, target_seq, n_predict, mtp_weights):
     x = x.view(-1, x.shape[-1])
     logits = torch.ops.nanogpt.mm_t(x, lm_head_weight, x_s=x_s, w_s=w_s, grad_s=grad_s)[0]
-    if USE_SOFTCAPPING:
-        logits = 23 * torch.sigmoid((logits + 5) / 7.5)
+    logits = 23 * torch.sigmoid((logits + 5) / 7.5)
     logits_flat = logits.view(-1, logits.size(-1))
     idx = F.pad(target_seq, (0, n_predict - 1)).unfold(0, n_predict, 1)
     target_logits = logits_flat.gather(1, idx)
