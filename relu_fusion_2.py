@@ -63,33 +63,45 @@ def linear_relu_square_kernel(a_desc, b_desc, c_desc, aux_desc,  #
         offs_am_c = pid_m * BLOCK_SIZE_M
         offs_bn_c = pid_n * BLOCK_SIZE_N
 
-        acc = tl.reshape(accumulator, (BLOCK_SIZE_M, 2, BLOCK_SIZE_N // 2))
-        acc = tl.permute(acc, (0, 2, 1))
-        acc0, acc1 = tl.split(acc)
+        #acc = tl.reshape(accumulator, (BLOCK_SIZE_M, 2, BLOCK_SIZE_N // 2))
+        #acc = tl.permute(acc, (0, 2, 1))
+        #acc0, acc1 = tl.split(acc)
 
-        c0 = acc0.to(dtype)
+        c = accumulator.to(dtype)
         if not FORWARD:
-            c0_pre = aux_desc.load([offs_am_c, offs_bn_c])
-            c0 = 2 * c0 * tl.where(c0_pre > 0, c0_pre, 0)
+            c_pre = aux_desc.load([offs_am_c, offs_bn_c])
+            c = 2 * c * tl.where(c_pre > 0, c_pre, 0)
 
-        c_desc.store([offs_am_c, offs_bn_c], c0)
+        c_desc.store([offs_am_c, offs_bn_c], c)
 
         if FORWARD:
-            c0_post = tl.maximum(c0, 0)
-            c0_post = c0_post * c0_post
-            aux_desc.store([offs_am_c, offs_bn_c], c0_post)
+            c_post = tl.maximum(c, 0)
+            c_post = c_post * c_post
+            aux_desc.store([offs_am_c, offs_bn_c], c_post)
 
-        c1 = acc1.to(dtype)
-        if not FORWARD:
-            c1_pre = aux_desc.load([offs_am_c, offs_bn_c + BLOCK_SIZE_N // 2])
-            c1 = 2 * c1 * tl.where(c1_pre > 0, c1_pre, 0)
+        #c0 = acc0.to(dtype)
+        #if not FORWARD:
+        #    c0_pre = aux_desc.load([offs_am_c, offs_bn_c])
+        #    c0 = 2 * c0 * tl.where(c0_pre > 0, c0_pre, 0)
 
-        c_desc.store([offs_am_c, offs_bn_c + BLOCK_SIZE_N // 2], c1)
+        #c_desc.store([offs_am_c, offs_bn_c], c0)
 
-        if FORWARD:
-            c1_post = tl.maximum(c1, 0)
-            c1_post = c1_post * c1_post
-            aux_desc.store([offs_am_c, offs_bn_c + BLOCK_SIZE_N // 2], c1_post)
+        #if FORWARD:
+        #    c0_post = tl.maximum(c0, 0)
+        #    c0_post = c0_post * c0_post
+        #    aux_desc.store([offs_am_c, offs_bn_c], c0_post)
+
+        #c1 = acc1.to(dtype)
+        #if not FORWARD:
+        #    c1_pre = aux_desc.load([offs_am_c, offs_bn_c + BLOCK_SIZE_N // 2])
+        #    c1 = 2 * c1 * tl.where(c1_pre > 0, c1_pre, 0)
+
+        #c_desc.store([offs_am_c, offs_bn_c + BLOCK_SIZE_N // 2], c1)
+
+        #if FORWARD:
+        #    c1_post = tl.maximum(c1, 0)
+        #    c1_post = c1_post * c1_post
+        #    aux_desc.store([offs_am_c, offs_bn_c + BLOCK_SIZE_N // 2], c1_post)
 
 
 def linear_relu_square(a, b, aux=None):
@@ -113,13 +125,13 @@ def linear_relu_square(a, b, aux=None):
     BLOCK_SIZE_M = 128
     BLOCK_SIZE_N = 256
     BLOCK_SIZE_K = 64
-    num_stages = 4 if FORWARD else 3
+    num_stages = 3 if FORWARD else 2
     num_warps = 8
 
     a_desc = TensorDescriptor.from_tensor(a, [BLOCK_SIZE_M, BLOCK_SIZE_K])
     b_desc = TensorDescriptor.from_tensor(b, [BLOCK_SIZE_N, BLOCK_SIZE_K])
-    c_desc = TensorDescriptor.from_tensor(c, [BLOCK_SIZE_M, BLOCK_SIZE_N // 2])
-    aux_desc = TensorDescriptor.from_tensor(aux, [BLOCK_SIZE_M, BLOCK_SIZE_N // 2])
+    c_desc = TensorDescriptor.from_tensor(c, [BLOCK_SIZE_M, BLOCK_SIZE_N])
+    aux_desc = TensorDescriptor.from_tensor(aux, [BLOCK_SIZE_M, BLOCK_SIZE_N])
 
     def grid(META):
         return (min(
